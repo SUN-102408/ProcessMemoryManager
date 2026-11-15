@@ -2,7 +2,7 @@ name: Build Process Memory Manager APK
 on:
   workflow_dispatch:
   push:
-    branches: [ main, master ]
+    branches: [ main, master, pmm-0.3.0-alpha1 ]
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -27,5 +27,5 @@ jobs:
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: ProcessMemoryManager-debug
+          name: ProcessMemoryManager-0.3.0-alpha1-debug
           path: app/build/outputs/apk/debug/app-debug.apk
