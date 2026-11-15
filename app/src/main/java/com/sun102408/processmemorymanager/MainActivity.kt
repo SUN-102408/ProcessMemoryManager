@@ -332,7 +332,7 @@ private object Root {
             DETAIL=$detailFlag
             INCLUDE_SYSTEM=$systemFlag
             total=0
-            for x in /proc/[0-9]*; do [ -d "\${'$'}x" ] && total=\${'$'}((total+1)); done
+            for x in /proc/[0-9]*; do [ -d "${'x" ] && total=\${'$'}((total+1)); done
             echo "TOTAL|\${'$'}total"
             echo "ZRAM|\${'$'}(cat /sys/block/zram0/mm_stat 2>/dev/null)"
             echo "SWAPS_BEGIN"
@@ -377,6 +377,5578 @@ private object Root {
               done_count=\${'$'}((done_count+1))
               if [ "\${'$'}DETAIL" = "1" ]; then stage="详细 PSS"; else stage="基础扫描"; fi
               echo "PROGRESS|\${'$'}done_count|\${'$'}total|\${'$'}stage|PID \${'$'}pid"
+            done
+            echo "SCAN_END"
+        """.trimIndent()
+
+        val process = try {
+            ProcessBuilder("su", "-c", script).redirectErrorStream(true).start()
+        } catch (e: Exception) {
+            return ScanResult(null, e.toString(), System.currentTimeMillis() - started)
+        }
+        val lines = java.util.Collections.synchronizedList(mutableListOf<String>())
+        var total = 0
+        val reader = thread(name = "pmm-stream-reader") {
+            try {
+                process.inputStream.bufferedReader().useLines { seq ->
+                    seq.forEach { line ->
+                        if (lines.size < 100000) lines.add(line)
+                        when {
+                            line.startsWith("TOTAL|") -> total = line.substringAfter('|').toIntOrNull() ?: 0
+                            line.startsWith("PROGRESS|") -> {
+                                val fields = line.split('|', limit = 5)
+                                if (fields.size >= 4) {
+                                    onProgress(fields[1].toIntOrNull() ?: 0, total, fields[3], fields.getOrElse(4) { "" })
+                                }
+                            }
+                        }
+                    }
+                }
+            } catch (_: Exception) {}
+        }
+        val finished = process.waitFor(if (detailed) 300 else 120, TimeUnit.SECONDS)
+        if (!finished) {
+            process.destroy()
+            if (process.isAlive) process.destroyForcibly()
+            reader.join(2000)
+            return ScanResult(null, "扫描超过时间限制（详细模式 300 秒 / 快速模式 120 秒）", System.currentTimeMillis() - started)
+        }
+        reader.join(2000)
+        val output = lines.toList()
+        if (process.exitValue() != 0 || "SCAN_END" !in output) {
+            return ScanResult(null, output.takeLast(35).joinToString("\n"), System.currentTimeMillis() - started)
+        }
+        var zram = "不可用"
+        val swaps = StringBuilder()
+        var inSwaps = false
+        val processes = mutableListOf<ProcessItem>()
+        output.forEach { line ->
+            when {
+                line.startsWith("ZRAM|") -> zram = line.substringAfter('|').ifBlank { "不可用" }
+                line == "SWAPS_BEGIN" -> inSwaps = true
+                line == "SWAPS_END" -> inSwaps = false
+                inSwaps -> if (line.isNotBlank()) swaps.append(line).append("; ")
+                line.startsWith("PROC|") -> {
+                    val f = line.split('|', limit = 8)
+                    if (f.size == 8) processes.add(ProcessItem(
+                        f[1].toIntOrNull() ?: 0, f[2].toIntOrNull() ?: 0, f[3], f[4],
+                        f[5].toLongOrNull() ?: 0, f[6].toLongOrNull() ?: -1, f[7].toLongOrNull() ?: 0
+                    ))
+                }
+            }
+        }
+        val time = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US).format(Date())
+        return ScanResult(Snapshot(time, processes, zram, swaps.toString().ifBlank { "不可用" }), "", System.currentTimeMillis() - started)
+    }
+}
+}x" ] && total=${'((total+1)); done
+            echo "TOTAL|\${'$'}total"
+            echo "ZRAM|\${'$'}(cat /sys/block/zram0/mm_stat 2>/dev/null)"
+            echo "SWAPS_BEGIN"
+            cat /proc/swaps 2>/dev/null
+            echo "SWAPS_END"
+            done_count=0
+            for x in /proc/[0-9]*; do
+              [ -d "\${'$'}x" ] || continue
+              pid=\${'$'}{x##*/}
+              status="\${'$'}x/status"
+              if [ ! -r "\${'$'}status" ]; then
+                done_count=\${'$'}((done_count+1))
+                echo "PROGRESS|\${'$'}done_count|\${'$'}total|读取进程|PID \${'$'}pid"
+                continue
+              fi
+              vals=\${'$'}(awk '/^Uid:/{u=\${'$'}2} /^VmRSS:/{r=\${'$'}2} /^VmSwap:/{s=\${'$'}2} /^Name:/{n=\${'$'}2} END{printf "%s|%s|%s|%s",u,r,s,n}' "\${'$'}status" 2>/dev/null)
+              oldifs=\${'$'}IFS
+              IFS='|'
+              set -- \${'$'}vals
+              IFS=\${'$'}oldifs
+              uid=\${'$'}{1:-0}; rss=\${'$'}{2:-0}; vswap=\${'$'}{3:-0}; name=\${'$'}{4:-unknown}
+              case "\${'$'}uid" in ''|*[!0-9]*) uid=0;; esac
+              case "\${'$'}rss" in ''|*[!0-9]*) rss=0;; esac
+              case "\${'$'}vswap" in ''|*[!0-9]*) vswap=0;; esac
+              if [ "\${'$'}INCLUDE_SYSTEM" = "0" ] && [ "\${'$'}uid" -lt 10000 ] 2>/dev/null; then
+                done_count=\${'$'}((done_count+1))
+                echo "PROGRESS|\${'$'}done_count|\${'$'}total|过滤系统进程|PID \${'$'}pid"
+                continue
+              fi
+              statline=\${'$'}(cat "\${'$'}x/stat" 2>/dev/null)
+              startticks=\${'$'}(printf '%s\\n' "\${'$'}statline" | awk '{sub(/^.*\\) /,""); print \${'$'}20}')
+              [ -n "\${'$'}startticks" ] || startticks=0
+              pss=-1
+              swap=\${'$'}vswap
+              if [ "\${'$'}DETAIL" = "1" ] && [ -r "\${'$'}x/smaps" ]; then
+                mem=\${'$'}(awk '/^Pss:/{p+=\${'$'}2} /^Swap:/{s+=\${'$'}2} END{printf "%d|%d",p,s}' "\${'$'}x/smaps" 2>/dev/null)
+                oldifs=\${'$'}IFS; IFS='|'; set -- \${'$'}mem; IFS=\${'$'}oldifs
+                pss=\${'$'}{1:--1}; swap=\${'$'}{2:-\${'$'}vswap}
+              fi
+              name=\${'$'}(printf '%s' "\${'$'}name" | tr '|\\t\\r\\n' '____')
+              echo "PROC|\${'$'}pid|\${'$'}uid|\${'$'}startticks|\${'$'}name|\${'$'}rss|\${'$'}pss|\${'$'}swap"
+              done_count=\${'$'}((done_count+1))
+              if [ "\${'$'}DETAIL" = "1" ]; then stage="详细 PSS"; else stage="基础扫描"; fi
+              echo "PROGRESS|\${'$'}done_count|\${'$'}total|\${'$'}stage|PID \${'$'}pid"
+            done
+            echo "SCAN_END"
+        """.trimIndent()
+
+        val process = try {
+            ProcessBuilder("su", "-c", script).redirectErrorStream(true).start()
+        } catch (e: Exception) {
+            return ScanResult(null, e.toString(), System.currentTimeMillis() - started)
+        }
+        val lines = java.util.Collections.synchronizedList(mutableListOf<String>())
+        var total = 0
+        val reader = thread(name = "pmm-stream-reader") {
+            try {
+                process.inputStream.bufferedReader().useLines { seq ->
+                    seq.forEach { line ->
+                        if (lines.size < 100000) lines.add(line)
+                        when {
+                            line.startsWith("TOTAL|") -> total = line.substringAfter('|').toIntOrNull() ?: 0
+                            line.startsWith("PROGRESS|") -> {
+                                val fields = line.split('|', limit = 5)
+                                if (fields.size >= 4) {
+                                    onProgress(fields[1].toIntOrNull() ?: 0, total, fields[3], fields.getOrElse(4) { "" })
+                                }
+                            }
+                        }
+                    }
+                }
+            } catch (_: Exception) {}
+        }
+        val finished = process.waitFor(if (detailed) 300 else 120, TimeUnit.SECONDS)
+        if (!finished) {
+            process.destroy()
+            if (process.isAlive) process.destroyForcibly()
+            reader.join(2000)
+            return ScanResult(null, "扫描超过时间限制（详细模式 300 秒 / 快速模式 120 秒）", System.currentTimeMillis() - started)
+        }
+        reader.join(2000)
+        val output = lines.toList()
+        if (process.exitValue() != 0 || "SCAN_END" !in output) {
+            return ScanResult(null, output.takeLast(35).joinToString("\n"), System.currentTimeMillis() - started)
+        }
+        var zram = "不可用"
+        val swaps = StringBuilder()
+        var inSwaps = false
+        val processes = mutableListOf<ProcessItem>()
+        output.forEach { line ->
+            when {
+                line.startsWith("ZRAM|") -> zram = line.substringAfter('|').ifBlank { "不可用" }
+                line == "SWAPS_BEGIN" -> inSwaps = true
+                line == "SWAPS_END" -> inSwaps = false
+                inSwaps -> if (line.isNotBlank()) swaps.append(line).append("; ")
+                line.startsWith("PROC|") -> {
+                    val f = line.split('|', limit = 8)
+                    if (f.size == 8) processes.add(ProcessItem(
+                        f[1].toIntOrNull() ?: 0, f[2].toIntOrNull() ?: 0, f[3], f[4],
+                        f[5].toLongOrNull() ?: 0, f[6].toLongOrNull() ?: -1, f[7].toLongOrNull() ?: 0
+                    ))
+                }
+            }
+        }
+        val time = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US).format(Date())
+        return ScanResult(Snapshot(time, processes, zram, swaps.toString().ifBlank { "不可用" }), "", System.currentTimeMillis() - started)
+    }
+}
+}((total+1)); done
+            echo "TOTAL|${'total"
+            echo "ZRAM|\${'$'}(cat /sys/block/zram0/mm_stat 2>/dev/null)"
+            echo "SWAPS_BEGIN"
+            cat /proc/swaps 2>/dev/null
+            echo "SWAPS_END"
+            done_count=0
+            for x in /proc/[0-9]*; do
+              [ -d "\${'$'}x" ] || continue
+              pid=\${'$'}{x##*/}
+              status="\${'$'}x/status"
+              if [ ! -r "\${'$'}status" ]; then
+                done_count=\${'$'}((done_count+1))
+                echo "PROGRESS|\${'$'}done_count|\${'$'}total|读取进程|PID \${'$'}pid"
+                continue
+              fi
+              vals=\${'$'}(awk '/^Uid:/{u=\${'$'}2} /^VmRSS:/{r=\${'$'}2} /^VmSwap:/{s=\${'$'}2} /^Name:/{n=\${'$'}2} END{printf "%s|%s|%s|%s",u,r,s,n}' "\${'$'}status" 2>/dev/null)
+              oldifs=\${'$'}IFS
+              IFS='|'
+              set -- \${'$'}vals
+              IFS=\${'$'}oldifs
+              uid=\${'$'}{1:-0}; rss=\${'$'}{2:-0}; vswap=\${'$'}{3:-0}; name=\${'$'}{4:-unknown}
+              case "\${'$'}uid" in ''|*[!0-9]*) uid=0;; esac
+              case "\${'$'}rss" in ''|*[!0-9]*) rss=0;; esac
+              case "\${'$'}vswap" in ''|*[!0-9]*) vswap=0;; esac
+              if [ "\${'$'}INCLUDE_SYSTEM" = "0" ] && [ "\${'$'}uid" -lt 10000 ] 2>/dev/null; then
+                done_count=\${'$'}((done_count+1))
+                echo "PROGRESS|\${'$'}done_count|\${'$'}total|过滤系统进程|PID \${'$'}pid"
+                continue
+              fi
+              statline=\${'$'}(cat "\${'$'}x/stat" 2>/dev/null)
+              startticks=\${'$'}(printf '%s\\n' "\${'$'}statline" | awk '{sub(/^.*\\) /,""); print \${'$'}20}')
+              [ -n "\${'$'}startticks" ] || startticks=0
+              pss=-1
+              swap=\${'$'}vswap
+              if [ "\${'$'}DETAIL" = "1" ] && [ -r "\${'$'}x/smaps" ]; then
+                mem=\${'$'}(awk '/^Pss:/{p+=\${'$'}2} /^Swap:/{s+=\${'$'}2} END{printf "%d|%d",p,s}' "\${'$'}x/smaps" 2>/dev/null)
+                oldifs=\${'$'}IFS; IFS='|'; set -- \${'$'}mem; IFS=\${'$'}oldifs
+                pss=\${'$'}{1:--1}; swap=\${'$'}{2:-\${'$'}vswap}
+              fi
+              name=\${'$'}(printf '%s' "\${'$'}name" | tr '|\\t\\r\\n' '____')
+              echo "PROC|\${'$'}pid|\${'$'}uid|\${'$'}startticks|\${'$'}name|\${'$'}rss|\${'$'}pss|\${'$'}swap"
+              done_count=\${'$'}((done_count+1))
+              if [ "\${'$'}DETAIL" = "1" ]; then stage="详细 PSS"; else stage="基础扫描"; fi
+              echo "PROGRESS|\${'$'}done_count|\${'$'}total|\${'$'}stage|PID \${'$'}pid"
+            done
+            echo "SCAN_END"
+        """.trimIndent()
+
+        val process = try {
+            ProcessBuilder("su", "-c", script).redirectErrorStream(true).start()
+        } catch (e: Exception) {
+            return ScanResult(null, e.toString(), System.currentTimeMillis() - started)
+        }
+        val lines = java.util.Collections.synchronizedList(mutableListOf<String>())
+        var total = 0
+        val reader = thread(name = "pmm-stream-reader") {
+            try {
+                process.inputStream.bufferedReader().useLines { seq ->
+                    seq.forEach { line ->
+                        if (lines.size < 100000) lines.add(line)
+                        when {
+                            line.startsWith("TOTAL|") -> total = line.substringAfter('|').toIntOrNull() ?: 0
+                            line.startsWith("PROGRESS|") -> {
+                                val fields = line.split('|', limit = 5)
+                                if (fields.size >= 4) {
+                                    onProgress(fields[1].toIntOrNull() ?: 0, total, fields[3], fields.getOrElse(4) { "" })
+                                }
+                            }
+                        }
+                    }
+                }
+            } catch (_: Exception) {}
+        }
+        val finished = process.waitFor(if (detailed) 300 else 120, TimeUnit.SECONDS)
+        if (!finished) {
+            process.destroy()
+            if (process.isAlive) process.destroyForcibly()
+            reader.join(2000)
+            return ScanResult(null, "扫描超过时间限制（详细模式 300 秒 / 快速模式 120 秒）", System.currentTimeMillis() - started)
+        }
+        reader.join(2000)
+        val output = lines.toList()
+        if (process.exitValue() != 0 || "SCAN_END" !in output) {
+            return ScanResult(null, output.takeLast(35).joinToString("\n"), System.currentTimeMillis() - started)
+        }
+        var zram = "不可用"
+        val swaps = StringBuilder()
+        var inSwaps = false
+        val processes = mutableListOf<ProcessItem>()
+        output.forEach { line ->
+            when {
+                line.startsWith("ZRAM|") -> zram = line.substringAfter('|').ifBlank { "不可用" }
+                line == "SWAPS_BEGIN" -> inSwaps = true
+                line == "SWAPS_END" -> inSwaps = false
+                inSwaps -> if (line.isNotBlank()) swaps.append(line).append("; ")
+                line.startsWith("PROC|") -> {
+                    val f = line.split('|', limit = 8)
+                    if (f.size == 8) processes.add(ProcessItem(
+                        f[1].toIntOrNull() ?: 0, f[2].toIntOrNull() ?: 0, f[3], f[4],
+                        f[5].toLongOrNull() ?: 0, f[6].toLongOrNull() ?: -1, f[7].toLongOrNull() ?: 0
+                    ))
+                }
+            }
+        }
+        val time = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US).format(Date())
+        return ScanResult(Snapshot(time, processes, zram, swaps.toString().ifBlank { "不可用" }), "", System.currentTimeMillis() - started)
+    }
+}
+}total"
+            echo "ZRAM|${'(cat /sys/block/zram0/mm_stat 2>/dev/null)"
+            echo "SWAPS_BEGIN"
+            cat /proc/swaps 2>/dev/null
+            echo "SWAPS_END"
+            done_count=0
+            for x in /proc/[0-9]*; do
+              [ -d "\${'$'}x" ] || continue
+              pid=\${'$'}{x##*/}
+              status="\${'$'}x/status"
+              if [ ! -r "\${'$'}status" ]; then
+                done_count=\${'$'}((done_count+1))
+                echo "PROGRESS|\${'$'}done_count|\${'$'}total|读取进程|PID \${'$'}pid"
+                continue
+              fi
+              vals=\${'$'}(awk '/^Uid:/{u=\${'$'}2} /^VmRSS:/{r=\${'$'}2} /^VmSwap:/{s=\${'$'}2} /^Name:/{n=\${'$'}2} END{printf "%s|%s|%s|%s",u,r,s,n}' "\${'$'}status" 2>/dev/null)
+              oldifs=\${'$'}IFS
+              IFS='|'
+              set -- \${'$'}vals
+              IFS=\${'$'}oldifs
+              uid=\${'$'}{1:-0}; rss=\${'$'}{2:-0}; vswap=\${'$'}{3:-0}; name=\${'$'}{4:-unknown}
+              case "\${'$'}uid" in ''|*[!0-9]*) uid=0;; esac
+              case "\${'$'}rss" in ''|*[!0-9]*) rss=0;; esac
+              case "\${'$'}vswap" in ''|*[!0-9]*) vswap=0;; esac
+              if [ "\${'$'}INCLUDE_SYSTEM" = "0" ] && [ "\${'$'}uid" -lt 10000 ] 2>/dev/null; then
+                done_count=\${'$'}((done_count+1))
+                echo "PROGRESS|\${'$'}done_count|\${'$'}total|过滤系统进程|PID \${'$'}pid"
+                continue
+              fi
+              statline=\${'$'}(cat "\${'$'}x/stat" 2>/dev/null)
+              startticks=\${'$'}(printf '%s\\n' "\${'$'}statline" | awk '{sub(/^.*\\) /,""); print \${'$'}20}')
+              [ -n "\${'$'}startticks" ] || startticks=0
+              pss=-1
+              swap=\${'$'}vswap
+              if [ "\${'$'}DETAIL" = "1" ] && [ -r "\${'$'}x/smaps" ]; then
+                mem=\${'$'}(awk '/^Pss:/{p+=\${'$'}2} /^Swap:/{s+=\${'$'}2} END{printf "%d|%d",p,s}' "\${'$'}x/smaps" 2>/dev/null)
+                oldifs=\${'$'}IFS; IFS='|'; set -- \${'$'}mem; IFS=\${'$'}oldifs
+                pss=\${'$'}{1:--1}; swap=\${'$'}{2:-\${'$'}vswap}
+              fi
+              name=\${'$'}(printf '%s' "\${'$'}name" | tr '|\\t\\r\\n' '____')
+              echo "PROC|\${'$'}pid|\${'$'}uid|\${'$'}startticks|\${'$'}name|\${'$'}rss|\${'$'}pss|\${'$'}swap"
+              done_count=\${'$'}((done_count+1))
+              if [ "\${'$'}DETAIL" = "1" ]; then stage="详细 PSS"; else stage="基础扫描"; fi
+              echo "PROGRESS|\${'$'}done_count|\${'$'}total|\${'$'}stage|PID \${'$'}pid"
+            done
+            echo "SCAN_END"
+        """.trimIndent()
+
+        val process = try {
+            ProcessBuilder("su", "-c", script).redirectErrorStream(true).start()
+        } catch (e: Exception) {
+            return ScanResult(null, e.toString(), System.currentTimeMillis() - started)
+        }
+        val lines = java.util.Collections.synchronizedList(mutableListOf<String>())
+        var total = 0
+        val reader = thread(name = "pmm-stream-reader") {
+            try {
+                process.inputStream.bufferedReader().useLines { seq ->
+                    seq.forEach { line ->
+                        if (lines.size < 100000) lines.add(line)
+                        when {
+                            line.startsWith("TOTAL|") -> total = line.substringAfter('|').toIntOrNull() ?: 0
+                            line.startsWith("PROGRESS|") -> {
+                                val fields = line.split('|', limit = 5)
+                                if (fields.size >= 4) {
+                                    onProgress(fields[1].toIntOrNull() ?: 0, total, fields[3], fields.getOrElse(4) { "" })
+                                }
+                            }
+                        }
+                    }
+                }
+            } catch (_: Exception) {}
+        }
+        val finished = process.waitFor(if (detailed) 300 else 120, TimeUnit.SECONDS)
+        if (!finished) {
+            process.destroy()
+            if (process.isAlive) process.destroyForcibly()
+            reader.join(2000)
+            return ScanResult(null, "扫描超过时间限制（详细模式 300 秒 / 快速模式 120 秒）", System.currentTimeMillis() - started)
+        }
+        reader.join(2000)
+        val output = lines.toList()
+        if (process.exitValue() != 0 || "SCAN_END" !in output) {
+            return ScanResult(null, output.takeLast(35).joinToString("\n"), System.currentTimeMillis() - started)
+        }
+        var zram = "不可用"
+        val swaps = StringBuilder()
+        var inSwaps = false
+        val processes = mutableListOf<ProcessItem>()
+        output.forEach { line ->
+            when {
+                line.startsWith("ZRAM|") -> zram = line.substringAfter('|').ifBlank { "不可用" }
+                line == "SWAPS_BEGIN" -> inSwaps = true
+                line == "SWAPS_END" -> inSwaps = false
+                inSwaps -> if (line.isNotBlank()) swaps.append(line).append("; ")
+                line.startsWith("PROC|") -> {
+                    val f = line.split('|', limit = 8)
+                    if (f.size == 8) processes.add(ProcessItem(
+                        f[1].toIntOrNull() ?: 0, f[2].toIntOrNull() ?: 0, f[3], f[4],
+                        f[5].toLongOrNull() ?: 0, f[6].toLongOrNull() ?: -1, f[7].toLongOrNull() ?: 0
+                    ))
+                }
+            }
+        }
+        val time = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US).format(Date())
+        return ScanResult(Snapshot(time, processes, zram, swaps.toString().ifBlank { "不可用" }), "", System.currentTimeMillis() - started)
+    }
+}
+}(cat /sys/block/zram0/mm_stat 2>/dev/null)"
+            echo "SWAPS_BEGIN"
+            cat /proc/swaps 2>/dev/null
+            echo "SWAPS_END"
+            done_count=0
+            for x in /proc/[0-9]*; do
+              [ -d "${'x" ] || continue
+              pid=\${'$'}{x##*/}
+              status="\${'$'}x/status"
+              if [ ! -r "\${'$'}status" ]; then
+                done_count=\${'$'}((done_count+1))
+                echo "PROGRESS|\${'$'}done_count|\${'$'}total|读取进程|PID \${'$'}pid"
+                continue
+              fi
+              vals=\${'$'}(awk '/^Uid:/{u=\${'$'}2} /^VmRSS:/{r=\${'$'}2} /^VmSwap:/{s=\${'$'}2} /^Name:/{n=\${'$'}2} END{printf "%s|%s|%s|%s",u,r,s,n}' "\${'$'}status" 2>/dev/null)
+              oldifs=\${'$'}IFS
+              IFS='|'
+              set -- \${'$'}vals
+              IFS=\${'$'}oldifs
+              uid=\${'$'}{1:-0}; rss=\${'$'}{2:-0}; vswap=\${'$'}{3:-0}; name=\${'$'}{4:-unknown}
+              case "\${'$'}uid" in ''|*[!0-9]*) uid=0;; esac
+              case "\${'$'}rss" in ''|*[!0-9]*) rss=0;; esac
+              case "\${'$'}vswap" in ''|*[!0-9]*) vswap=0;; esac
+              if [ "\${'$'}INCLUDE_SYSTEM" = "0" ] && [ "\${'$'}uid" -lt 10000 ] 2>/dev/null; then
+                done_count=\${'$'}((done_count+1))
+                echo "PROGRESS|\${'$'}done_count|\${'$'}total|过滤系统进程|PID \${'$'}pid"
+                continue
+              fi
+              statline=\${'$'}(cat "\${'$'}x/stat" 2>/dev/null)
+              startticks=\${'$'}(printf '%s\\n' "\${'$'}statline" | awk '{sub(/^.*\\) /,""); print \${'$'}20}')
+              [ -n "\${'$'}startticks" ] || startticks=0
+              pss=-1
+              swap=\${'$'}vswap
+              if [ "\${'$'}DETAIL" = "1" ] && [ -r "\${'$'}x/smaps" ]; then
+                mem=\${'$'}(awk '/^Pss:/{p+=\${'$'}2} /^Swap:/{s+=\${'$'}2} END{printf "%d|%d",p,s}' "\${'$'}x/smaps" 2>/dev/null)
+                oldifs=\${'$'}IFS; IFS='|'; set -- \${'$'}mem; IFS=\${'$'}oldifs
+                pss=\${'$'}{1:--1}; swap=\${'$'}{2:-\${'$'}vswap}
+              fi
+              name=\${'$'}(printf '%s' "\${'$'}name" | tr '|\\t\\r\\n' '____')
+              echo "PROC|\${'$'}pid|\${'$'}uid|\${'$'}startticks|\${'$'}name|\${'$'}rss|\${'$'}pss|\${'$'}swap"
+              done_count=\${'$'}((done_count+1))
+              if [ "\${'$'}DETAIL" = "1" ]; then stage="详细 PSS"; else stage="基础扫描"; fi
+              echo "PROGRESS|\${'$'}done_count|\${'$'}total|\${'$'}stage|PID \${'$'}pid"
+            done
+            echo "SCAN_END"
+        """.trimIndent()
+
+        val process = try {
+            ProcessBuilder("su", "-c", script).redirectErrorStream(true).start()
+        } catch (e: Exception) {
+            return ScanResult(null, e.toString(), System.currentTimeMillis() - started)
+        }
+        val lines = java.util.Collections.synchronizedList(mutableListOf<String>())
+        var total = 0
+        val reader = thread(name = "pmm-stream-reader") {
+            try {
+                process.inputStream.bufferedReader().useLines { seq ->
+                    seq.forEach { line ->
+                        if (lines.size < 100000) lines.add(line)
+                        when {
+                            line.startsWith("TOTAL|") -> total = line.substringAfter('|').toIntOrNull() ?: 0
+                            line.startsWith("PROGRESS|") -> {
+                                val fields = line.split('|', limit = 5)
+                                if (fields.size >= 4) {
+                                    onProgress(fields[1].toIntOrNull() ?: 0, total, fields[3], fields.getOrElse(4) { "" })
+                                }
+                            }
+                        }
+                    }
+                }
+            } catch (_: Exception) {}
+        }
+        val finished = process.waitFor(if (detailed) 300 else 120, TimeUnit.SECONDS)
+        if (!finished) {
+            process.destroy()
+            if (process.isAlive) process.destroyForcibly()
+            reader.join(2000)
+            return ScanResult(null, "扫描超过时间限制（详细模式 300 秒 / 快速模式 120 秒）", System.currentTimeMillis() - started)
+        }
+        reader.join(2000)
+        val output = lines.toList()
+        if (process.exitValue() != 0 || "SCAN_END" !in output) {
+            return ScanResult(null, output.takeLast(35).joinToString("\n"), System.currentTimeMillis() - started)
+        }
+        var zram = "不可用"
+        val swaps = StringBuilder()
+        var inSwaps = false
+        val processes = mutableListOf<ProcessItem>()
+        output.forEach { line ->
+            when {
+                line.startsWith("ZRAM|") -> zram = line.substringAfter('|').ifBlank { "不可用" }
+                line == "SWAPS_BEGIN" -> inSwaps = true
+                line == "SWAPS_END" -> inSwaps = false
+                inSwaps -> if (line.isNotBlank()) swaps.append(line).append("; ")
+                line.startsWith("PROC|") -> {
+                    val f = line.split('|', limit = 8)
+                    if (f.size == 8) processes.add(ProcessItem(
+                        f[1].toIntOrNull() ?: 0, f[2].toIntOrNull() ?: 0, f[3], f[4],
+                        f[5].toLongOrNull() ?: 0, f[6].toLongOrNull() ?: -1, f[7].toLongOrNull() ?: 0
+                    ))
+                }
+            }
+        }
+        val time = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US).format(Date())
+        return ScanResult(Snapshot(time, processes, zram, swaps.toString().ifBlank { "不可用" }), "", System.currentTimeMillis() - started)
+    }
+}
+}x" ] || continue
+              pid=${'{x##*/}
+              status="\${'$'}x/status"
+              if [ ! -r "\${'$'}status" ]; then
+                done_count=\${'$'}((done_count+1))
+                echo "PROGRESS|\${'$'}done_count|\${'$'}total|读取进程|PID \${'$'}pid"
+                continue
+              fi
+              vals=\${'$'}(awk '/^Uid:/{u=\${'$'}2} /^VmRSS:/{r=\${'$'}2} /^VmSwap:/{s=\${'$'}2} /^Name:/{n=\${'$'}2} END{printf "%s|%s|%s|%s",u,r,s,n}' "\${'$'}status" 2>/dev/null)
+              oldifs=\${'$'}IFS
+              IFS='|'
+              set -- \${'$'}vals
+              IFS=\${'$'}oldifs
+              uid=\${'$'}{1:-0}; rss=\${'$'}{2:-0}; vswap=\${'$'}{3:-0}; name=\${'$'}{4:-unknown}
+              case "\${'$'}uid" in ''|*[!0-9]*) uid=0;; esac
+              case "\${'$'}rss" in ''|*[!0-9]*) rss=0;; esac
+              case "\${'$'}vswap" in ''|*[!0-9]*) vswap=0;; esac
+              if [ "\${'$'}INCLUDE_SYSTEM" = "0" ] && [ "\${'$'}uid" -lt 10000 ] 2>/dev/null; then
+                done_count=\${'$'}((done_count+1))
+                echo "PROGRESS|\${'$'}done_count|\${'$'}total|过滤系统进程|PID \${'$'}pid"
+                continue
+              fi
+              statline=\${'$'}(cat "\${'$'}x/stat" 2>/dev/null)
+              startticks=\${'$'}(printf '%s\\n' "\${'$'}statline" | awk '{sub(/^.*\\) /,""); print \${'$'}20}')
+              [ -n "\${'$'}startticks" ] || startticks=0
+              pss=-1
+              swap=\${'$'}vswap
+              if [ "\${'$'}DETAIL" = "1" ] && [ -r "\${'$'}x/smaps" ]; then
+                mem=\${'$'}(awk '/^Pss:/{p+=\${'$'}2} /^Swap:/{s+=\${'$'}2} END{printf "%d|%d",p,s}' "\${'$'}x/smaps" 2>/dev/null)
+                oldifs=\${'$'}IFS; IFS='|'; set -- \${'$'}mem; IFS=\${'$'}oldifs
+                pss=\${'$'}{1:--1}; swap=\${'$'}{2:-\${'$'}vswap}
+              fi
+              name=\${'$'}(printf '%s' "\${'$'}name" | tr '|\\t\\r\\n' '____')
+              echo "PROC|\${'$'}pid|\${'$'}uid|\${'$'}startticks|\${'$'}name|\${'$'}rss|\${'$'}pss|\${'$'}swap"
+              done_count=\${'$'}((done_count+1))
+              if [ "\${'$'}DETAIL" = "1" ]; then stage="详细 PSS"; else stage="基础扫描"; fi
+              echo "PROGRESS|\${'$'}done_count|\${'$'}total|\${'$'}stage|PID \${'$'}pid"
+            done
+            echo "SCAN_END"
+        """.trimIndent()
+
+        val process = try {
+            ProcessBuilder("su", "-c", script).redirectErrorStream(true).start()
+        } catch (e: Exception) {
+            return ScanResult(null, e.toString(), System.currentTimeMillis() - started)
+        }
+        val lines = java.util.Collections.synchronizedList(mutableListOf<String>())
+        var total = 0
+        val reader = thread(name = "pmm-stream-reader") {
+            try {
+                process.inputStream.bufferedReader().useLines { seq ->
+                    seq.forEach { line ->
+                        if (lines.size < 100000) lines.add(line)
+                        when {
+                            line.startsWith("TOTAL|") -> total = line.substringAfter('|').toIntOrNull() ?: 0
+                            line.startsWith("PROGRESS|") -> {
+                                val fields = line.split('|', limit = 5)
+                                if (fields.size >= 4) {
+                                    onProgress(fields[1].toIntOrNull() ?: 0, total, fields[3], fields.getOrElse(4) { "" })
+                                }
+                            }
+                        }
+                    }
+                }
+            } catch (_: Exception) {}
+        }
+        val finished = process.waitFor(if (detailed) 300 else 120, TimeUnit.SECONDS)
+        if (!finished) {
+            process.destroy()
+            if (process.isAlive) process.destroyForcibly()
+            reader.join(2000)
+            return ScanResult(null, "扫描超过时间限制（详细模式 300 秒 / 快速模式 120 秒）", System.currentTimeMillis() - started)
+        }
+        reader.join(2000)
+        val output = lines.toList()
+        if (process.exitValue() != 0 || "SCAN_END" !in output) {
+            return ScanResult(null, output.takeLast(35).joinToString("\n"), System.currentTimeMillis() - started)
+        }
+        var zram = "不可用"
+        val swaps = StringBuilder()
+        var inSwaps = false
+        val processes = mutableListOf<ProcessItem>()
+        output.forEach { line ->
+            when {
+                line.startsWith("ZRAM|") -> zram = line.substringAfter('|').ifBlank { "不可用" }
+                line == "SWAPS_BEGIN" -> inSwaps = true
+                line == "SWAPS_END" -> inSwaps = false
+                inSwaps -> if (line.isNotBlank()) swaps.append(line).append("; ")
+                line.startsWith("PROC|") -> {
+                    val f = line.split('|', limit = 8)
+                    if (f.size == 8) processes.add(ProcessItem(
+                        f[1].toIntOrNull() ?: 0, f[2].toIntOrNull() ?: 0, f[3], f[4],
+                        f[5].toLongOrNull() ?: 0, f[6].toLongOrNull() ?: -1, f[7].toLongOrNull() ?: 0
+                    ))
+                }
+            }
+        }
+        val time = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US).format(Date())
+        return ScanResult(Snapshot(time, processes, zram, swaps.toString().ifBlank { "不可用" }), "", System.currentTimeMillis() - started)
+    }
+}
+}{x##*/}
+              status="${'x/status"
+              if [ ! -r "\${'$'}status" ]; then
+                done_count=\${'$'}((done_count+1))
+                echo "PROGRESS|\${'$'}done_count|\${'$'}total|读取进程|PID \${'$'}pid"
+                continue
+              fi
+              vals=\${'$'}(awk '/^Uid:/{u=\${'$'}2} /^VmRSS:/{r=\${'$'}2} /^VmSwap:/{s=\${'$'}2} /^Name:/{n=\${'$'}2} END{printf "%s|%s|%s|%s",u,r,s,n}' "\${'$'}status" 2>/dev/null)
+              oldifs=\${'$'}IFS
+              IFS='|'
+              set -- \${'$'}vals
+              IFS=\${'$'}oldifs
+              uid=\${'$'}{1:-0}; rss=\${'$'}{2:-0}; vswap=\${'$'}{3:-0}; name=\${'$'}{4:-unknown}
+              case "\${'$'}uid" in ''|*[!0-9]*) uid=0;; esac
+              case "\${'$'}rss" in ''|*[!0-9]*) rss=0;; esac
+              case "\${'$'}vswap" in ''|*[!0-9]*) vswap=0;; esac
+              if [ "\${'$'}INCLUDE_SYSTEM" = "0" ] && [ "\${'$'}uid" -lt 10000 ] 2>/dev/null; then
+                done_count=\${'$'}((done_count+1))
+                echo "PROGRESS|\${'$'}done_count|\${'$'}total|过滤系统进程|PID \${'$'}pid"
+                continue
+              fi
+              statline=\${'$'}(cat "\${'$'}x/stat" 2>/dev/null)
+              startticks=\${'$'}(printf '%s\\n' "\${'$'}statline" | awk '{sub(/^.*\\) /,""); print \${'$'}20}')
+              [ -n "\${'$'}startticks" ] || startticks=0
+              pss=-1
+              swap=\${'$'}vswap
+              if [ "\${'$'}DETAIL" = "1" ] && [ -r "\${'$'}x/smaps" ]; then
+                mem=\${'$'}(awk '/^Pss:/{p+=\${'$'}2} /^Swap:/{s+=\${'$'}2} END{printf "%d|%d",p,s}' "\${'$'}x/smaps" 2>/dev/null)
+                oldifs=\${'$'}IFS; IFS='|'; set -- \${'$'}mem; IFS=\${'$'}oldifs
+                pss=\${'$'}{1:--1}; swap=\${'$'}{2:-\${'$'}vswap}
+              fi
+              name=\${'$'}(printf '%s' "\${'$'}name" | tr '|\\t\\r\\n' '____')
+              echo "PROC|\${'$'}pid|\${'$'}uid|\${'$'}startticks|\${'$'}name|\${'$'}rss|\${'$'}pss|\${'$'}swap"
+              done_count=\${'$'}((done_count+1))
+              if [ "\${'$'}DETAIL" = "1" ]; then stage="详细 PSS"; else stage="基础扫描"; fi
+              echo "PROGRESS|\${'$'}done_count|\${'$'}total|\${'$'}stage|PID \${'$'}pid"
+            done
+            echo "SCAN_END"
+        """.trimIndent()
+
+        val process = try {
+            ProcessBuilder("su", "-c", script).redirectErrorStream(true).start()
+        } catch (e: Exception) {
+            return ScanResult(null, e.toString(), System.currentTimeMillis() - started)
+        }
+        val lines = java.util.Collections.synchronizedList(mutableListOf<String>())
+        var total = 0
+        val reader = thread(name = "pmm-stream-reader") {
+            try {
+                process.inputStream.bufferedReader().useLines { seq ->
+                    seq.forEach { line ->
+                        if (lines.size < 100000) lines.add(line)
+                        when {
+                            line.startsWith("TOTAL|") -> total = line.substringAfter('|').toIntOrNull() ?: 0
+                            line.startsWith("PROGRESS|") -> {
+                                val fields = line.split('|', limit = 5)
+                                if (fields.size >= 4) {
+                                    onProgress(fields[1].toIntOrNull() ?: 0, total, fields[3], fields.getOrElse(4) { "" })
+                                }
+                            }
+                        }
+                    }
+                }
+            } catch (_: Exception) {}
+        }
+        val finished = process.waitFor(if (detailed) 300 else 120, TimeUnit.SECONDS)
+        if (!finished) {
+            process.destroy()
+            if (process.isAlive) process.destroyForcibly()
+            reader.join(2000)
+            return ScanResult(null, "扫描超过时间限制（详细模式 300 秒 / 快速模式 120 秒）", System.currentTimeMillis() - started)
+        }
+        reader.join(2000)
+        val output = lines.toList()
+        if (process.exitValue() != 0 || "SCAN_END" !in output) {
+            return ScanResult(null, output.takeLast(35).joinToString("\n"), System.currentTimeMillis() - started)
+        }
+        var zram = "不可用"
+        val swaps = StringBuilder()
+        var inSwaps = false
+        val processes = mutableListOf<ProcessItem>()
+        output.forEach { line ->
+            when {
+                line.startsWith("ZRAM|") -> zram = line.substringAfter('|').ifBlank { "不可用" }
+                line == "SWAPS_BEGIN" -> inSwaps = true
+                line == "SWAPS_END" -> inSwaps = false
+                inSwaps -> if (line.isNotBlank()) swaps.append(line).append("; ")
+                line.startsWith("PROC|") -> {
+                    val f = line.split('|', limit = 8)
+                    if (f.size == 8) processes.add(ProcessItem(
+                        f[1].toIntOrNull() ?: 0, f[2].toIntOrNull() ?: 0, f[3], f[4],
+                        f[5].toLongOrNull() ?: 0, f[6].toLongOrNull() ?: -1, f[7].toLongOrNull() ?: 0
+                    ))
+                }
+            }
+        }
+        val time = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US).format(Date())
+        return ScanResult(Snapshot(time, processes, zram, swaps.toString().ifBlank { "不可用" }), "", System.currentTimeMillis() - started)
+    }
+}
+}x/status"
+              if [ ! -r "${'status" ]; then
+                done_count=\${'$'}((done_count+1))
+                echo "PROGRESS|\${'$'}done_count|\${'$'}total|读取进程|PID \${'$'}pid"
+                continue
+              fi
+              vals=\${'$'}(awk '/^Uid:/{u=\${'$'}2} /^VmRSS:/{r=\${'$'}2} /^VmSwap:/{s=\${'$'}2} /^Name:/{n=\${'$'}2} END{printf "%s|%s|%s|%s",u,r,s,n}' "\${'$'}status" 2>/dev/null)
+              oldifs=\${'$'}IFS
+              IFS='|'
+              set -- \${'$'}vals
+              IFS=\${'$'}oldifs
+              uid=\${'$'}{1:-0}; rss=\${'$'}{2:-0}; vswap=\${'$'}{3:-0}; name=\${'$'}{4:-unknown}
+              case "\${'$'}uid" in ''|*[!0-9]*) uid=0;; esac
+              case "\${'$'}rss" in ''|*[!0-9]*) rss=0;; esac
+              case "\${'$'}vswap" in ''|*[!0-9]*) vswap=0;; esac
+              if [ "\${'$'}INCLUDE_SYSTEM" = "0" ] && [ "\${'$'}uid" -lt 10000 ] 2>/dev/null; then
+                done_count=\${'$'}((done_count+1))
+                echo "PROGRESS|\${'$'}done_count|\${'$'}total|过滤系统进程|PID \${'$'}pid"
+                continue
+              fi
+              statline=\${'$'}(cat "\${'$'}x/stat" 2>/dev/null)
+              startticks=\${'$'}(printf '%s\\n' "\${'$'}statline" | awk '{sub(/^.*\\) /,""); print \${'$'}20}')
+              [ -n "\${'$'}startticks" ] || startticks=0
+              pss=-1
+              swap=\${'$'}vswap
+              if [ "\${'$'}DETAIL" = "1" ] && [ -r "\${'$'}x/smaps" ]; then
+                mem=\${'$'}(awk '/^Pss:/{p+=\${'$'}2} /^Swap:/{s+=\${'$'}2} END{printf "%d|%d",p,s}' "\${'$'}x/smaps" 2>/dev/null)
+                oldifs=\${'$'}IFS; IFS='|'; set -- \${'$'}mem; IFS=\${'$'}oldifs
+                pss=\${'$'}{1:--1}; swap=\${'$'}{2:-\${'$'}vswap}
+              fi
+              name=\${'$'}(printf '%s' "\${'$'}name" | tr '|\\t\\r\\n' '____')
+              echo "PROC|\${'$'}pid|\${'$'}uid|\${'$'}startticks|\${'$'}name|\${'$'}rss|\${'$'}pss|\${'$'}swap"
+              done_count=\${'$'}((done_count+1))
+              if [ "\${'$'}DETAIL" = "1" ]; then stage="详细 PSS"; else stage="基础扫描"; fi
+              echo "PROGRESS|\${'$'}done_count|\${'$'}total|\${'$'}stage|PID \${'$'}pid"
+            done
+            echo "SCAN_END"
+        """.trimIndent()
+
+        val process = try {
+            ProcessBuilder("su", "-c", script).redirectErrorStream(true).start()
+        } catch (e: Exception) {
+            return ScanResult(null, e.toString(), System.currentTimeMillis() - started)
+        }
+        val lines = java.util.Collections.synchronizedList(mutableListOf<String>())
+        var total = 0
+        val reader = thread(name = "pmm-stream-reader") {
+            try {
+                process.inputStream.bufferedReader().useLines { seq ->
+                    seq.forEach { line ->
+                        if (lines.size < 100000) lines.add(line)
+                        when {
+                            line.startsWith("TOTAL|") -> total = line.substringAfter('|').toIntOrNull() ?: 0
+                            line.startsWith("PROGRESS|") -> {
+                                val fields = line.split('|', limit = 5)
+                                if (fields.size >= 4) {
+                                    onProgress(fields[1].toIntOrNull() ?: 0, total, fields[3], fields.getOrElse(4) { "" })
+                                }
+                            }
+                        }
+                    }
+                }
+            } catch (_: Exception) {}
+        }
+        val finished = process.waitFor(if (detailed) 300 else 120, TimeUnit.SECONDS)
+        if (!finished) {
+            process.destroy()
+            if (process.isAlive) process.destroyForcibly()
+            reader.join(2000)
+            return ScanResult(null, "扫描超过时间限制（详细模式 300 秒 / 快速模式 120 秒）", System.currentTimeMillis() - started)
+        }
+        reader.join(2000)
+        val output = lines.toList()
+        if (process.exitValue() != 0 || "SCAN_END" !in output) {
+            return ScanResult(null, output.takeLast(35).joinToString("\n"), System.currentTimeMillis() - started)
+        }
+        var zram = "不可用"
+        val swaps = StringBuilder()
+        var inSwaps = false
+        val processes = mutableListOf<ProcessItem>()
+        output.forEach { line ->
+            when {
+                line.startsWith("ZRAM|") -> zram = line.substringAfter('|').ifBlank { "不可用" }
+                line == "SWAPS_BEGIN" -> inSwaps = true
+                line == "SWAPS_END" -> inSwaps = false
+                inSwaps -> if (line.isNotBlank()) swaps.append(line).append("; ")
+                line.startsWith("PROC|") -> {
+                    val f = line.split('|', limit = 8)
+                    if (f.size == 8) processes.add(ProcessItem(
+                        f[1].toIntOrNull() ?: 0, f[2].toIntOrNull() ?: 0, f[3], f[4],
+                        f[5].toLongOrNull() ?: 0, f[6].toLongOrNull() ?: -1, f[7].toLongOrNull() ?: 0
+                    ))
+                }
+            }
+        }
+        val time = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US).format(Date())
+        return ScanResult(Snapshot(time, processes, zram, swaps.toString().ifBlank { "不可用" }), "", System.currentTimeMillis() - started)
+    }
+}
+}status" ]; then
+                done_count=${'((done_count+1))
+                echo "PROGRESS|\${'$'}done_count|\${'$'}total|读取进程|PID \${'$'}pid"
+                continue
+              fi
+              vals=\${'$'}(awk '/^Uid:/{u=\${'$'}2} /^VmRSS:/{r=\${'$'}2} /^VmSwap:/{s=\${'$'}2} /^Name:/{n=\${'$'}2} END{printf "%s|%s|%s|%s",u,r,s,n}' "\${'$'}status" 2>/dev/null)
+              oldifs=\${'$'}IFS
+              IFS='|'
+              set -- \${'$'}vals
+              IFS=\${'$'}oldifs
+              uid=\${'$'}{1:-0}; rss=\${'$'}{2:-0}; vswap=\${'$'}{3:-0}; name=\${'$'}{4:-unknown}
+              case "\${'$'}uid" in ''|*[!0-9]*) uid=0;; esac
+              case "\${'$'}rss" in ''|*[!0-9]*) rss=0;; esac
+              case "\${'$'}vswap" in ''|*[!0-9]*) vswap=0;; esac
+              if [ "\${'$'}INCLUDE_SYSTEM" = "0" ] && [ "\${'$'}uid" -lt 10000 ] 2>/dev/null; then
+                done_count=\${'$'}((done_count+1))
+                echo "PROGRESS|\${'$'}done_count|\${'$'}total|过滤系统进程|PID \${'$'}pid"
+                continue
+              fi
+              statline=\${'$'}(cat "\${'$'}x/stat" 2>/dev/null)
+              startticks=\${'$'}(printf '%s\\n' "\${'$'}statline" | awk '{sub(/^.*\\) /,""); print \${'$'}20}')
+              [ -n "\${'$'}startticks" ] || startticks=0
+              pss=-1
+              swap=\${'$'}vswap
+              if [ "\${'$'}DETAIL" = "1" ] && [ -r "\${'$'}x/smaps" ]; then
+                mem=\${'$'}(awk '/^Pss:/{p+=\${'$'}2} /^Swap:/{s+=\${'$'}2} END{printf "%d|%d",p,s}' "\${'$'}x/smaps" 2>/dev/null)
+                oldifs=\${'$'}IFS; IFS='|'; set -- \${'$'}mem; IFS=\${'$'}oldifs
+                pss=\${'$'}{1:--1}; swap=\${'$'}{2:-\${'$'}vswap}
+              fi
+              name=\${'$'}(printf '%s' "\${'$'}name" | tr '|\\t\\r\\n' '____')
+              echo "PROC|\${'$'}pid|\${'$'}uid|\${'$'}startticks|\${'$'}name|\${'$'}rss|\${'$'}pss|\${'$'}swap"
+              done_count=\${'$'}((done_count+1))
+              if [ "\${'$'}DETAIL" = "1" ]; then stage="详细 PSS"; else stage="基础扫描"; fi
+              echo "PROGRESS|\${'$'}done_count|\${'$'}total|\${'$'}stage|PID \${'$'}pid"
+            done
+            echo "SCAN_END"
+        """.trimIndent()
+
+        val process = try {
+            ProcessBuilder("su", "-c", script).redirectErrorStream(true).start()
+        } catch (e: Exception) {
+            return ScanResult(null, e.toString(), System.currentTimeMillis() - started)
+        }
+        val lines = java.util.Collections.synchronizedList(mutableListOf<String>())
+        var total = 0
+        val reader = thread(name = "pmm-stream-reader") {
+            try {
+                process.inputStream.bufferedReader().useLines { seq ->
+                    seq.forEach { line ->
+                        if (lines.size < 100000) lines.add(line)
+                        when {
+                            line.startsWith("TOTAL|") -> total = line.substringAfter('|').toIntOrNull() ?: 0
+                            line.startsWith("PROGRESS|") -> {
+                                val fields = line.split('|', limit = 5)
+                                if (fields.size >= 4) {
+                                    onProgress(fields[1].toIntOrNull() ?: 0, total, fields[3], fields.getOrElse(4) { "" })
+                                }
+                            }
+                        }
+                    }
+                }
+            } catch (_: Exception) {}
+        }
+        val finished = process.waitFor(if (detailed) 300 else 120, TimeUnit.SECONDS)
+        if (!finished) {
+            process.destroy()
+            if (process.isAlive) process.destroyForcibly()
+            reader.join(2000)
+            return ScanResult(null, "扫描超过时间限制（详细模式 300 秒 / 快速模式 120 秒）", System.currentTimeMillis() - started)
+        }
+        reader.join(2000)
+        val output = lines.toList()
+        if (process.exitValue() != 0 || "SCAN_END" !in output) {
+            return ScanResult(null, output.takeLast(35).joinToString("\n"), System.currentTimeMillis() - started)
+        }
+        var zram = "不可用"
+        val swaps = StringBuilder()
+        var inSwaps = false
+        val processes = mutableListOf<ProcessItem>()
+        output.forEach { line ->
+            when {
+                line.startsWith("ZRAM|") -> zram = line.substringAfter('|').ifBlank { "不可用" }
+                line == "SWAPS_BEGIN" -> inSwaps = true
+                line == "SWAPS_END" -> inSwaps = false
+                inSwaps -> if (line.isNotBlank()) swaps.append(line).append("; ")
+                line.startsWith("PROC|") -> {
+                    val f = line.split('|', limit = 8)
+                    if (f.size == 8) processes.add(ProcessItem(
+                        f[1].toIntOrNull() ?: 0, f[2].toIntOrNull() ?: 0, f[3], f[4],
+                        f[5].toLongOrNull() ?: 0, f[6].toLongOrNull() ?: -1, f[7].toLongOrNull() ?: 0
+                    ))
+                }
+            }
+        }
+        val time = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US).format(Date())
+        return ScanResult(Snapshot(time, processes, zram, swaps.toString().ifBlank { "不可用" }), "", System.currentTimeMillis() - started)
+    }
+}
+}((done_count+1))
+                echo "PROGRESS|${'done_count|\${'$'}total|读取进程|PID \${'$'}pid"
+                continue
+              fi
+              vals=\${'$'}(awk '/^Uid:/{u=\${'$'}2} /^VmRSS:/{r=\${'$'}2} /^VmSwap:/{s=\${'$'}2} /^Name:/{n=\${'$'}2} END{printf "%s|%s|%s|%s",u,r,s,n}' "\${'$'}status" 2>/dev/null)
+              oldifs=\${'$'}IFS
+              IFS='|'
+              set -- \${'$'}vals
+              IFS=\${'$'}oldifs
+              uid=\${'$'}{1:-0}; rss=\${'$'}{2:-0}; vswap=\${'$'}{3:-0}; name=\${'$'}{4:-unknown}
+              case "\${'$'}uid" in ''|*[!0-9]*) uid=0;; esac
+              case "\${'$'}rss" in ''|*[!0-9]*) rss=0;; esac
+              case "\${'$'}vswap" in ''|*[!0-9]*) vswap=0;; esac
+              if [ "\${'$'}INCLUDE_SYSTEM" = "0" ] && [ "\${'$'}uid" -lt 10000 ] 2>/dev/null; then
+                done_count=\${'$'}((done_count+1))
+                echo "PROGRESS|\${'$'}done_count|\${'$'}total|过滤系统进程|PID \${'$'}pid"
+                continue
+              fi
+              statline=\${'$'}(cat "\${'$'}x/stat" 2>/dev/null)
+              startticks=\${'$'}(printf '%s\\n' "\${'$'}statline" | awk '{sub(/^.*\\) /,""); print \${'$'}20}')
+              [ -n "\${'$'}startticks" ] || startticks=0
+              pss=-1
+              swap=\${'$'}vswap
+              if [ "\${'$'}DETAIL" = "1" ] && [ -r "\${'$'}x/smaps" ]; then
+                mem=\${'$'}(awk '/^Pss:/{p+=\${'$'}2} /^Swap:/{s+=\${'$'}2} END{printf "%d|%d",p,s}' "\${'$'}x/smaps" 2>/dev/null)
+                oldifs=\${'$'}IFS; IFS='|'; set -- \${'$'}mem; IFS=\${'$'}oldifs
+                pss=\${'$'}{1:--1}; swap=\${'$'}{2:-\${'$'}vswap}
+              fi
+              name=\${'$'}(printf '%s' "\${'$'}name" | tr '|\\t\\r\\n' '____')
+              echo "PROC|\${'$'}pid|\${'$'}uid|\${'$'}startticks|\${'$'}name|\${'$'}rss|\${'$'}pss|\${'$'}swap"
+              done_count=\${'$'}((done_count+1))
+              if [ "\${'$'}DETAIL" = "1" ]; then stage="详细 PSS"; else stage="基础扫描"; fi
+              echo "PROGRESS|\${'$'}done_count|\${'$'}total|\${'$'}stage|PID \${'$'}pid"
+            done
+            echo "SCAN_END"
+        """.trimIndent()
+
+        val process = try {
+            ProcessBuilder("su", "-c", script).redirectErrorStream(true).start()
+        } catch (e: Exception) {
+            return ScanResult(null, e.toString(), System.currentTimeMillis() - started)
+        }
+        val lines = java.util.Collections.synchronizedList(mutableListOf<String>())
+        var total = 0
+        val reader = thread(name = "pmm-stream-reader") {
+            try {
+                process.inputStream.bufferedReader().useLines { seq ->
+                    seq.forEach { line ->
+                        if (lines.size < 100000) lines.add(line)
+                        when {
+                            line.startsWith("TOTAL|") -> total = line.substringAfter('|').toIntOrNull() ?: 0
+                            line.startsWith("PROGRESS|") -> {
+                                val fields = line.split('|', limit = 5)
+                                if (fields.size >= 4) {
+                                    onProgress(fields[1].toIntOrNull() ?: 0, total, fields[3], fields.getOrElse(4) { "" })
+                                }
+                            }
+                        }
+                    }
+                }
+            } catch (_: Exception) {}
+        }
+        val finished = process.waitFor(if (detailed) 300 else 120, TimeUnit.SECONDS)
+        if (!finished) {
+            process.destroy()
+            if (process.isAlive) process.destroyForcibly()
+            reader.join(2000)
+            return ScanResult(null, "扫描超过时间限制（详细模式 300 秒 / 快速模式 120 秒）", System.currentTimeMillis() - started)
+        }
+        reader.join(2000)
+        val output = lines.toList()
+        if (process.exitValue() != 0 || "SCAN_END" !in output) {
+            return ScanResult(null, output.takeLast(35).joinToString("\n"), System.currentTimeMillis() - started)
+        }
+        var zram = "不可用"
+        val swaps = StringBuilder()
+        var inSwaps = false
+        val processes = mutableListOf<ProcessItem>()
+        output.forEach { line ->
+            when {
+                line.startsWith("ZRAM|") -> zram = line.substringAfter('|').ifBlank { "不可用" }
+                line == "SWAPS_BEGIN" -> inSwaps = true
+                line == "SWAPS_END" -> inSwaps = false
+                inSwaps -> if (line.isNotBlank()) swaps.append(line).append("; ")
+                line.startsWith("PROC|") -> {
+                    val f = line.split('|', limit = 8)
+                    if (f.size == 8) processes.add(ProcessItem(
+                        f[1].toIntOrNull() ?: 0, f[2].toIntOrNull() ?: 0, f[3], f[4],
+                        f[5].toLongOrNull() ?: 0, f[6].toLongOrNull() ?: -1, f[7].toLongOrNull() ?: 0
+                    ))
+                }
+            }
+        }
+        val time = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US).format(Date())
+        return ScanResult(Snapshot(time, processes, zram, swaps.toString().ifBlank { "不可用" }), "", System.currentTimeMillis() - started)
+    }
+}
+}done_count|${'total|读取进程|PID \${'$'}pid"
+                continue
+              fi
+              vals=\${'$'}(awk '/^Uid:/{u=\${'$'}2} /^VmRSS:/{r=\${'$'}2} /^VmSwap:/{s=\${'$'}2} /^Name:/{n=\${'$'}2} END{printf "%s|%s|%s|%s",u,r,s,n}' "\${'$'}status" 2>/dev/null)
+              oldifs=\${'$'}IFS
+              IFS='|'
+              set -- \${'$'}vals
+              IFS=\${'$'}oldifs
+              uid=\${'$'}{1:-0}; rss=\${'$'}{2:-0}; vswap=\${'$'}{3:-0}; name=\${'$'}{4:-unknown}
+              case "\${'$'}uid" in ''|*[!0-9]*) uid=0;; esac
+              case "\${'$'}rss" in ''|*[!0-9]*) rss=0;; esac
+              case "\${'$'}vswap" in ''|*[!0-9]*) vswap=0;; esac
+              if [ "\${'$'}INCLUDE_SYSTEM" = "0" ] && [ "\${'$'}uid" -lt 10000 ] 2>/dev/null; then
+                done_count=\${'$'}((done_count+1))
+                echo "PROGRESS|\${'$'}done_count|\${'$'}total|过滤系统进程|PID \${'$'}pid"
+                continue
+              fi
+              statline=\${'$'}(cat "\${'$'}x/stat" 2>/dev/null)
+              startticks=\${'$'}(printf '%s\\n' "\${'$'}statline" | awk '{sub(/^.*\\) /,""); print \${'$'}20}')
+              [ -n "\${'$'}startticks" ] || startticks=0
+              pss=-1
+              swap=\${'$'}vswap
+              if [ "\${'$'}DETAIL" = "1" ] && [ -r "\${'$'}x/smaps" ]; then
+                mem=\${'$'}(awk '/^Pss:/{p+=\${'$'}2} /^Swap:/{s+=\${'$'}2} END{printf "%d|%d",p,s}' "\${'$'}x/smaps" 2>/dev/null)
+                oldifs=\${'$'}IFS; IFS='|'; set -- \${'$'}mem; IFS=\${'$'}oldifs
+                pss=\${'$'}{1:--1}; swap=\${'$'}{2:-\${'$'}vswap}
+              fi
+              name=\${'$'}(printf '%s' "\${'$'}name" | tr '|\\t\\r\\n' '____')
+              echo "PROC|\${'$'}pid|\${'$'}uid|\${'$'}startticks|\${'$'}name|\${'$'}rss|\${'$'}pss|\${'$'}swap"
+              done_count=\${'$'}((done_count+1))
+              if [ "\${'$'}DETAIL" = "1" ]; then stage="详细 PSS"; else stage="基础扫描"; fi
+              echo "PROGRESS|\${'$'}done_count|\${'$'}total|\${'$'}stage|PID \${'$'}pid"
+            done
+            echo "SCAN_END"
+        """.trimIndent()
+
+        val process = try {
+            ProcessBuilder("su", "-c", script).redirectErrorStream(true).start()
+        } catch (e: Exception) {
+            return ScanResult(null, e.toString(), System.currentTimeMillis() - started)
+        }
+        val lines = java.util.Collections.synchronizedList(mutableListOf<String>())
+        var total = 0
+        val reader = thread(name = "pmm-stream-reader") {
+            try {
+                process.inputStream.bufferedReader().useLines { seq ->
+                    seq.forEach { line ->
+                        if (lines.size < 100000) lines.add(line)
+                        when {
+                            line.startsWith("TOTAL|") -> total = line.substringAfter('|').toIntOrNull() ?: 0
+                            line.startsWith("PROGRESS|") -> {
+                                val fields = line.split('|', limit = 5)
+                                if (fields.size >= 4) {
+                                    onProgress(fields[1].toIntOrNull() ?: 0, total, fields[3], fields.getOrElse(4) { "" })
+                                }
+                            }
+                        }
+                    }
+                }
+            } catch (_: Exception) {}
+        }
+        val finished = process.waitFor(if (detailed) 300 else 120, TimeUnit.SECONDS)
+        if (!finished) {
+            process.destroy()
+            if (process.isAlive) process.destroyForcibly()
+            reader.join(2000)
+            return ScanResult(null, "扫描超过时间限制（详细模式 300 秒 / 快速模式 120 秒）", System.currentTimeMillis() - started)
+        }
+        reader.join(2000)
+        val output = lines.toList()
+        if (process.exitValue() != 0 || "SCAN_END" !in output) {
+            return ScanResult(null, output.takeLast(35).joinToString("\n"), System.currentTimeMillis() - started)
+        }
+        var zram = "不可用"
+        val swaps = StringBuilder()
+        var inSwaps = false
+        val processes = mutableListOf<ProcessItem>()
+        output.forEach { line ->
+            when {
+                line.startsWith("ZRAM|") -> zram = line.substringAfter('|').ifBlank { "不可用" }
+                line == "SWAPS_BEGIN" -> inSwaps = true
+                line == "SWAPS_END" -> inSwaps = false
+                inSwaps -> if (line.isNotBlank()) swaps.append(line).append("; ")
+                line.startsWith("PROC|") -> {
+                    val f = line.split('|', limit = 8)
+                    if (f.size == 8) processes.add(ProcessItem(
+                        f[1].toIntOrNull() ?: 0, f[2].toIntOrNull() ?: 0, f[3], f[4],
+                        f[5].toLongOrNull() ?: 0, f[6].toLongOrNull() ?: -1, f[7].toLongOrNull() ?: 0
+                    ))
+                }
+            }
+        }
+        val time = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US).format(Date())
+        return ScanResult(Snapshot(time, processes, zram, swaps.toString().ifBlank { "不可用" }), "", System.currentTimeMillis() - started)
+    }
+}
+}total|读取进程|PID ${'pid"
+                continue
+              fi
+              vals=\${'$'}(awk '/^Uid:/{u=\${'$'}2} /^VmRSS:/{r=\${'$'}2} /^VmSwap:/{s=\${'$'}2} /^Name:/{n=\${'$'}2} END{printf "%s|%s|%s|%s",u,r,s,n}' "\${'$'}status" 2>/dev/null)
+              oldifs=\${'$'}IFS
+              IFS='|'
+              set -- \${'$'}vals
+              IFS=\${'$'}oldifs
+              uid=\${'$'}{1:-0}; rss=\${'$'}{2:-0}; vswap=\${'$'}{3:-0}; name=\${'$'}{4:-unknown}
+              case "\${'$'}uid" in ''|*[!0-9]*) uid=0;; esac
+              case "\${'$'}rss" in ''|*[!0-9]*) rss=0;; esac
+              case "\${'$'}vswap" in ''|*[!0-9]*) vswap=0;; esac
+              if [ "\${'$'}INCLUDE_SYSTEM" = "0" ] && [ "\${'$'}uid" -lt 10000 ] 2>/dev/null; then
+                done_count=\${'$'}((done_count+1))
+                echo "PROGRESS|\${'$'}done_count|\${'$'}total|过滤系统进程|PID \${'$'}pid"
+                continue
+              fi
+              statline=\${'$'}(cat "\${'$'}x/stat" 2>/dev/null)
+              startticks=\${'$'}(printf '%s\\n' "\${'$'}statline" | awk '{sub(/^.*\\) /,""); print \${'$'}20}')
+              [ -n "\${'$'}startticks" ] || startticks=0
+              pss=-1
+              swap=\${'$'}vswap
+              if [ "\${'$'}DETAIL" = "1" ] && [ -r "\${'$'}x/smaps" ]; then
+                mem=\${'$'}(awk '/^Pss:/{p+=\${'$'}2} /^Swap:/{s+=\${'$'}2} END{printf "%d|%d",p,s}' "\${'$'}x/smaps" 2>/dev/null)
+                oldifs=\${'$'}IFS; IFS='|'; set -- \${'$'}mem; IFS=\${'$'}oldifs
+                pss=\${'$'}{1:--1}; swap=\${'$'}{2:-\${'$'}vswap}
+              fi
+              name=\${'$'}(printf '%s' "\${'$'}name" | tr '|\\t\\r\\n' '____')
+              echo "PROC|\${'$'}pid|\${'$'}uid|\${'$'}startticks|\${'$'}name|\${'$'}rss|\${'$'}pss|\${'$'}swap"
+              done_count=\${'$'}((done_count+1))
+              if [ "\${'$'}DETAIL" = "1" ]; then stage="详细 PSS"; else stage="基础扫描"; fi
+              echo "PROGRESS|\${'$'}done_count|\${'$'}total|\${'$'}stage|PID \${'$'}pid"
+            done
+            echo "SCAN_END"
+        """.trimIndent()
+
+        val process = try {
+            ProcessBuilder("su", "-c", script).redirectErrorStream(true).start()
+        } catch (e: Exception) {
+            return ScanResult(null, e.toString(), System.currentTimeMillis() - started)
+        }
+        val lines = java.util.Collections.synchronizedList(mutableListOf<String>())
+        var total = 0
+        val reader = thread(name = "pmm-stream-reader") {
+            try {
+                process.inputStream.bufferedReader().useLines { seq ->
+                    seq.forEach { line ->
+                        if (lines.size < 100000) lines.add(line)
+                        when {
+                            line.startsWith("TOTAL|") -> total = line.substringAfter('|').toIntOrNull() ?: 0
+                            line.startsWith("PROGRESS|") -> {
+                                val fields = line.split('|', limit = 5)
+                                if (fields.size >= 4) {
+                                    onProgress(fields[1].toIntOrNull() ?: 0, total, fields[3], fields.getOrElse(4) { "" })
+                                }
+                            }
+                        }
+                    }
+                }
+            } catch (_: Exception) {}
+        }
+        val finished = process.waitFor(if (detailed) 300 else 120, TimeUnit.SECONDS)
+        if (!finished) {
+            process.destroy()
+            if (process.isAlive) process.destroyForcibly()
+            reader.join(2000)
+            return ScanResult(null, "扫描超过时间限制（详细模式 300 秒 / 快速模式 120 秒）", System.currentTimeMillis() - started)
+        }
+        reader.join(2000)
+        val output = lines.toList()
+        if (process.exitValue() != 0 || "SCAN_END" !in output) {
+            return ScanResult(null, output.takeLast(35).joinToString("\n"), System.currentTimeMillis() - started)
+        }
+        var zram = "不可用"
+        val swaps = StringBuilder()
+        var inSwaps = false
+        val processes = mutableListOf<ProcessItem>()
+        output.forEach { line ->
+            when {
+                line.startsWith("ZRAM|") -> zram = line.substringAfter('|').ifBlank { "不可用" }
+                line == "SWAPS_BEGIN" -> inSwaps = true
+                line == "SWAPS_END" -> inSwaps = false
+                inSwaps -> if (line.isNotBlank()) swaps.append(line).append("; ")
+                line.startsWith("PROC|") -> {
+                    val f = line.split('|', limit = 8)
+                    if (f.size == 8) processes.add(ProcessItem(
+                        f[1].toIntOrNull() ?: 0, f[2].toIntOrNull() ?: 0, f[3], f[4],
+                        f[5].toLongOrNull() ?: 0, f[6].toLongOrNull() ?: -1, f[7].toLongOrNull() ?: 0
+                    ))
+                }
+            }
+        }
+        val time = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US).format(Date())
+        return ScanResult(Snapshot(time, processes, zram, swaps.toString().ifBlank { "不可用" }), "", System.currentTimeMillis() - started)
+    }
+}
+}pid"
+                continue
+              fi
+              vals=${'(awk '/^Uid:/{u=\${'$'}2} /^VmRSS:/{r=\${'$'}2} /^VmSwap:/{s=\${'$'}2} /^Name:/{n=\${'$'}2} END{printf "%s|%s|%s|%s",u,r,s,n}' "\${'$'}status" 2>/dev/null)
+              oldifs=\${'$'}IFS
+              IFS='|'
+              set -- \${'$'}vals
+              IFS=\${'$'}oldifs
+              uid=\${'$'}{1:-0}; rss=\${'$'}{2:-0}; vswap=\${'$'}{3:-0}; name=\${'$'}{4:-unknown}
+              case "\${'$'}uid" in ''|*[!0-9]*) uid=0;; esac
+              case "\${'$'}rss" in ''|*[!0-9]*) rss=0;; esac
+              case "\${'$'}vswap" in ''|*[!0-9]*) vswap=0;; esac
+              if [ "\${'$'}INCLUDE_SYSTEM" = "0" ] && [ "\${'$'}uid" -lt 10000 ] 2>/dev/null; then
+                done_count=\${'$'}((done_count+1))
+                echo "PROGRESS|\${'$'}done_count|\${'$'}total|过滤系统进程|PID \${'$'}pid"
+                continue
+              fi
+              statline=\${'$'}(cat "\${'$'}x/stat" 2>/dev/null)
+              startticks=\${'$'}(printf '%s\\n' "\${'$'}statline" | awk '{sub(/^.*\\) /,""); print \${'$'}20}')
+              [ -n "\${'$'}startticks" ] || startticks=0
+              pss=-1
+              swap=\${'$'}vswap
+              if [ "\${'$'}DETAIL" = "1" ] && [ -r "\${'$'}x/smaps" ]; then
+                mem=\${'$'}(awk '/^Pss:/{p+=\${'$'}2} /^Swap:/{s+=\${'$'}2} END{printf "%d|%d",p,s}' "\${'$'}x/smaps" 2>/dev/null)
+                oldifs=\${'$'}IFS; IFS='|'; set -- \${'$'}mem; IFS=\${'$'}oldifs
+                pss=\${'$'}{1:--1}; swap=\${'$'}{2:-\${'$'}vswap}
+              fi
+              name=\${'$'}(printf '%s' "\${'$'}name" | tr '|\\t\\r\\n' '____')
+              echo "PROC|\${'$'}pid|\${'$'}uid|\${'$'}startticks|\${'$'}name|\${'$'}rss|\${'$'}pss|\${'$'}swap"
+              done_count=\${'$'}((done_count+1))
+              if [ "\${'$'}DETAIL" = "1" ]; then stage="详细 PSS"; else stage="基础扫描"; fi
+              echo "PROGRESS|\${'$'}done_count|\${'$'}total|\${'$'}stage|PID \${'$'}pid"
+            done
+            echo "SCAN_END"
+        """.trimIndent()
+
+        val process = try {
+            ProcessBuilder("su", "-c", script).redirectErrorStream(true).start()
+        } catch (e: Exception) {
+            return ScanResult(null, e.toString(), System.currentTimeMillis() - started)
+        }
+        val lines = java.util.Collections.synchronizedList(mutableListOf<String>())
+        var total = 0
+        val reader = thread(name = "pmm-stream-reader") {
+            try {
+                process.inputStream.bufferedReader().useLines { seq ->
+                    seq.forEach { line ->
+                        if (lines.size < 100000) lines.add(line)
+                        when {
+                            line.startsWith("TOTAL|") -> total = line.substringAfter('|').toIntOrNull() ?: 0
+                            line.startsWith("PROGRESS|") -> {
+                                val fields = line.split('|', limit = 5)
+                                if (fields.size >= 4) {
+                                    onProgress(fields[1].toIntOrNull() ?: 0, total, fields[3], fields.getOrElse(4) { "" })
+                                }
+                            }
+                        }
+                    }
+                }
+            } catch (_: Exception) {}
+        }
+        val finished = process.waitFor(if (detailed) 300 else 120, TimeUnit.SECONDS)
+        if (!finished) {
+            process.destroy()
+            if (process.isAlive) process.destroyForcibly()
+            reader.join(2000)
+            return ScanResult(null, "扫描超过时间限制（详细模式 300 秒 / 快速模式 120 秒）", System.currentTimeMillis() - started)
+        }
+        reader.join(2000)
+        val output = lines.toList()
+        if (process.exitValue() != 0 || "SCAN_END" !in output) {
+            return ScanResult(null, output.takeLast(35).joinToString("\n"), System.currentTimeMillis() - started)
+        }
+        var zram = "不可用"
+        val swaps = StringBuilder()
+        var inSwaps = false
+        val processes = mutableListOf<ProcessItem>()
+        output.forEach { line ->
+            when {
+                line.startsWith("ZRAM|") -> zram = line.substringAfter('|').ifBlank { "不可用" }
+                line == "SWAPS_BEGIN" -> inSwaps = true
+                line == "SWAPS_END" -> inSwaps = false
+                inSwaps -> if (line.isNotBlank()) swaps.append(line).append("; ")
+                line.startsWith("PROC|") -> {
+                    val f = line.split('|', limit = 8)
+                    if (f.size == 8) processes.add(ProcessItem(
+                        f[1].toIntOrNull() ?: 0, f[2].toIntOrNull() ?: 0, f[3], f[4],
+                        f[5].toLongOrNull() ?: 0, f[6].toLongOrNull() ?: -1, f[7].toLongOrNull() ?: 0
+                    ))
+                }
+            }
+        }
+        val time = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US).format(Date())
+        return ScanResult(Snapshot(time, processes, zram, swaps.toString().ifBlank { "不可用" }), "", System.currentTimeMillis() - started)
+    }
+}
+}(awk '/^Uid:/{u=${'2} /^VmRSS:/{r=\${'$'}2} /^VmSwap:/{s=\${'$'}2} /^Name:/{n=\${'$'}2} END{printf "%s|%s|%s|%s",u,r,s,n}' "\${'$'}status" 2>/dev/null)
+              oldifs=\${'$'}IFS
+              IFS='|'
+              set -- \${'$'}vals
+              IFS=\${'$'}oldifs
+              uid=\${'$'}{1:-0}; rss=\${'$'}{2:-0}; vswap=\${'$'}{3:-0}; name=\${'$'}{4:-unknown}
+              case "\${'$'}uid" in ''|*[!0-9]*) uid=0;; esac
+              case "\${'$'}rss" in ''|*[!0-9]*) rss=0;; esac
+              case "\${'$'}vswap" in ''|*[!0-9]*) vswap=0;; esac
+              if [ "\${'$'}INCLUDE_SYSTEM" = "0" ] && [ "\${'$'}uid" -lt 10000 ] 2>/dev/null; then
+                done_count=\${'$'}((done_count+1))
+                echo "PROGRESS|\${'$'}done_count|\${'$'}total|过滤系统进程|PID \${'$'}pid"
+                continue
+              fi
+              statline=\${'$'}(cat "\${'$'}x/stat" 2>/dev/null)
+              startticks=\${'$'}(printf '%s\\n' "\${'$'}statline" | awk '{sub(/^.*\\) /,""); print \${'$'}20}')
+              [ -n "\${'$'}startticks" ] || startticks=0
+              pss=-1
+              swap=\${'$'}vswap
+              if [ "\${'$'}DETAIL" = "1" ] && [ -r "\${'$'}x/smaps" ]; then
+                mem=\${'$'}(awk '/^Pss:/{p+=\${'$'}2} /^Swap:/{s+=\${'$'}2} END{printf "%d|%d",p,s}' "\${'$'}x/smaps" 2>/dev/null)
+                oldifs=\${'$'}IFS; IFS='|'; set -- \${'$'}mem; IFS=\${'$'}oldifs
+                pss=\${'$'}{1:--1}; swap=\${'$'}{2:-\${'$'}vswap}
+              fi
+              name=\${'$'}(printf '%s' "\${'$'}name" | tr '|\\t\\r\\n' '____')
+              echo "PROC|\${'$'}pid|\${'$'}uid|\${'$'}startticks|\${'$'}name|\${'$'}rss|\${'$'}pss|\${'$'}swap"
+              done_count=\${'$'}((done_count+1))
+              if [ "\${'$'}DETAIL" = "1" ]; then stage="详细 PSS"; else stage="基础扫描"; fi
+              echo "PROGRESS|\${'$'}done_count|\${'$'}total|\${'$'}stage|PID \${'$'}pid"
+            done
+            echo "SCAN_END"
+        """.trimIndent()
+
+        val process = try {
+            ProcessBuilder("su", "-c", script).redirectErrorStream(true).start()
+        } catch (e: Exception) {
+            return ScanResult(null, e.toString(), System.currentTimeMillis() - started)
+        }
+        val lines = java.util.Collections.synchronizedList(mutableListOf<String>())
+        var total = 0
+        val reader = thread(name = "pmm-stream-reader") {
+            try {
+                process.inputStream.bufferedReader().useLines { seq ->
+                    seq.forEach { line ->
+                        if (lines.size < 100000) lines.add(line)
+                        when {
+                            line.startsWith("TOTAL|") -> total = line.substringAfter('|').toIntOrNull() ?: 0
+                            line.startsWith("PROGRESS|") -> {
+                                val fields = line.split('|', limit = 5)
+                                if (fields.size >= 4) {
+                                    onProgress(fields[1].toIntOrNull() ?: 0, total, fields[3], fields.getOrElse(4) { "" })
+                                }
+                            }
+                        }
+                    }
+                }
+            } catch (_: Exception) {}
+        }
+        val finished = process.waitFor(if (detailed) 300 else 120, TimeUnit.SECONDS)
+        if (!finished) {
+            process.destroy()
+            if (process.isAlive) process.destroyForcibly()
+            reader.join(2000)
+            return ScanResult(null, "扫描超过时间限制（详细模式 300 秒 / 快速模式 120 秒）", System.currentTimeMillis() - started)
+        }
+        reader.join(2000)
+        val output = lines.toList()
+        if (process.exitValue() != 0 || "SCAN_END" !in output) {
+            return ScanResult(null, output.takeLast(35).joinToString("\n"), System.currentTimeMillis() - started)
+        }
+        var zram = "不可用"
+        val swaps = StringBuilder()
+        var inSwaps = false
+        val processes = mutableListOf<ProcessItem>()
+        output.forEach { line ->
+            when {
+                line.startsWith("ZRAM|") -> zram = line.substringAfter('|').ifBlank { "不可用" }
+                line == "SWAPS_BEGIN" -> inSwaps = true
+                line == "SWAPS_END" -> inSwaps = false
+                inSwaps -> if (line.isNotBlank()) swaps.append(line).append("; ")
+                line.startsWith("PROC|") -> {
+                    val f = line.split('|', limit = 8)
+                    if (f.size == 8) processes.add(ProcessItem(
+                        f[1].toIntOrNull() ?: 0, f[2].toIntOrNull() ?: 0, f[3], f[4],
+                        f[5].toLongOrNull() ?: 0, f[6].toLongOrNull() ?: -1, f[7].toLongOrNull() ?: 0
+                    ))
+                }
+            }
+        }
+        val time = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US).format(Date())
+        return ScanResult(Snapshot(time, processes, zram, swaps.toString().ifBlank { "不可用" }), "", System.currentTimeMillis() - started)
+    }
+}
+}2} /^VmRSS:/{r=${'2} /^VmSwap:/{s=\${'$'}2} /^Name:/{n=\${'$'}2} END{printf "%s|%s|%s|%s",u,r,s,n}' "\${'$'}status" 2>/dev/null)
+              oldifs=\${'$'}IFS
+              IFS='|'
+              set -- \${'$'}vals
+              IFS=\${'$'}oldifs
+              uid=\${'$'}{1:-0}; rss=\${'$'}{2:-0}; vswap=\${'$'}{3:-0}; name=\${'$'}{4:-unknown}
+              case "\${'$'}uid" in ''|*[!0-9]*) uid=0;; esac
+              case "\${'$'}rss" in ''|*[!0-9]*) rss=0;; esac
+              case "\${'$'}vswap" in ''|*[!0-9]*) vswap=0;; esac
+              if [ "\${'$'}INCLUDE_SYSTEM" = "0" ] && [ "\${'$'}uid" -lt 10000 ] 2>/dev/null; then
+                done_count=\${'$'}((done_count+1))
+                echo "PROGRESS|\${'$'}done_count|\${'$'}total|过滤系统进程|PID \${'$'}pid"
+                continue
+              fi
+              statline=\${'$'}(cat "\${'$'}x/stat" 2>/dev/null)
+              startticks=\${'$'}(printf '%s\\n' "\${'$'}statline" | awk '{sub(/^.*\\) /,""); print \${'$'}20}')
+              [ -n "\${'$'}startticks" ] || startticks=0
+              pss=-1
+              swap=\${'$'}vswap
+              if [ "\${'$'}DETAIL" = "1" ] && [ -r "\${'$'}x/smaps" ]; then
+                mem=\${'$'}(awk '/^Pss:/{p+=\${'$'}2} /^Swap:/{s+=\${'$'}2} END{printf "%d|%d",p,s}' "\${'$'}x/smaps" 2>/dev/null)
+                oldifs=\${'$'}IFS; IFS='|'; set -- \${'$'}mem; IFS=\${'$'}oldifs
+                pss=\${'$'}{1:--1}; swap=\${'$'}{2:-\${'$'}vswap}
+              fi
+              name=\${'$'}(printf '%s' "\${'$'}name" | tr '|\\t\\r\\n' '____')
+              echo "PROC|\${'$'}pid|\${'$'}uid|\${'$'}startticks|\${'$'}name|\${'$'}rss|\${'$'}pss|\${'$'}swap"
+              done_count=\${'$'}((done_count+1))
+              if [ "\${'$'}DETAIL" = "1" ]; then stage="详细 PSS"; else stage="基础扫描"; fi
+              echo "PROGRESS|\${'$'}done_count|\${'$'}total|\${'$'}stage|PID \${'$'}pid"
+            done
+            echo "SCAN_END"
+        """.trimIndent()
+
+        val process = try {
+            ProcessBuilder("su", "-c", script).redirectErrorStream(true).start()
+        } catch (e: Exception) {
+            return ScanResult(null, e.toString(), System.currentTimeMillis() - started)
+        }
+        val lines = java.util.Collections.synchronizedList(mutableListOf<String>())
+        var total = 0
+        val reader = thread(name = "pmm-stream-reader") {
+            try {
+                process.inputStream.bufferedReader().useLines { seq ->
+                    seq.forEach { line ->
+                        if (lines.size < 100000) lines.add(line)
+                        when {
+                            line.startsWith("TOTAL|") -> total = line.substringAfter('|').toIntOrNull() ?: 0
+                            line.startsWith("PROGRESS|") -> {
+                                val fields = line.split('|', limit = 5)
+                                if (fields.size >= 4) {
+                                    onProgress(fields[1].toIntOrNull() ?: 0, total, fields[3], fields.getOrElse(4) { "" })
+                                }
+                            }
+                        }
+                    }
+                }
+            } catch (_: Exception) {}
+        }
+        val finished = process.waitFor(if (detailed) 300 else 120, TimeUnit.SECONDS)
+        if (!finished) {
+            process.destroy()
+            if (process.isAlive) process.destroyForcibly()
+            reader.join(2000)
+            return ScanResult(null, "扫描超过时间限制（详细模式 300 秒 / 快速模式 120 秒）", System.currentTimeMillis() - started)
+        }
+        reader.join(2000)
+        val output = lines.toList()
+        if (process.exitValue() != 0 || "SCAN_END" !in output) {
+            return ScanResult(null, output.takeLast(35).joinToString("\n"), System.currentTimeMillis() - started)
+        }
+        var zram = "不可用"
+        val swaps = StringBuilder()
+        var inSwaps = false
+        val processes = mutableListOf<ProcessItem>()
+        output.forEach { line ->
+            when {
+                line.startsWith("ZRAM|") -> zram = line.substringAfter('|').ifBlank { "不可用" }
+                line == "SWAPS_BEGIN" -> inSwaps = true
+                line == "SWAPS_END" -> inSwaps = false
+                inSwaps -> if (line.isNotBlank()) swaps.append(line).append("; ")
+                line.startsWith("PROC|") -> {
+                    val f = line.split('|', limit = 8)
+                    if (f.size == 8) processes.add(ProcessItem(
+                        f[1].toIntOrNull() ?: 0, f[2].toIntOrNull() ?: 0, f[3], f[4],
+                        f[5].toLongOrNull() ?: 0, f[6].toLongOrNull() ?: -1, f[7].toLongOrNull() ?: 0
+                    ))
+                }
+            }
+        }
+        val time = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US).format(Date())
+        return ScanResult(Snapshot(time, processes, zram, swaps.toString().ifBlank { "不可用" }), "", System.currentTimeMillis() - started)
+    }
+}
+}2} /^VmSwap:/{s=${'2} /^Name:/{n=\${'$'}2} END{printf "%s|%s|%s|%s",u,r,s,n}' "\${'$'}status" 2>/dev/null)
+              oldifs=\${'$'}IFS
+              IFS='|'
+              set -- \${'$'}vals
+              IFS=\${'$'}oldifs
+              uid=\${'$'}{1:-0}; rss=\${'$'}{2:-0}; vswap=\${'$'}{3:-0}; name=\${'$'}{4:-unknown}
+              case "\${'$'}uid" in ''|*[!0-9]*) uid=0;; esac
+              case "\${'$'}rss" in ''|*[!0-9]*) rss=0;; esac
+              case "\${'$'}vswap" in ''|*[!0-9]*) vswap=0;; esac
+              if [ "\${'$'}INCLUDE_SYSTEM" = "0" ] && [ "\${'$'}uid" -lt 10000 ] 2>/dev/null; then
+                done_count=\${'$'}((done_count+1))
+                echo "PROGRESS|\${'$'}done_count|\${'$'}total|过滤系统进程|PID \${'$'}pid"
+                continue
+              fi
+              statline=\${'$'}(cat "\${'$'}x/stat" 2>/dev/null)
+              startticks=\${'$'}(printf '%s\\n' "\${'$'}statline" | awk '{sub(/^.*\\) /,""); print \${'$'}20}')
+              [ -n "\${'$'}startticks" ] || startticks=0
+              pss=-1
+              swap=\${'$'}vswap
+              if [ "\${'$'}DETAIL" = "1" ] && [ -r "\${'$'}x/smaps" ]; then
+                mem=\${'$'}(awk '/^Pss:/{p+=\${'$'}2} /^Swap:/{s+=\${'$'}2} END{printf "%d|%d",p,s}' "\${'$'}x/smaps" 2>/dev/null)
+                oldifs=\${'$'}IFS; IFS='|'; set -- \${'$'}mem; IFS=\${'$'}oldifs
+                pss=\${'$'}{1:--1}; swap=\${'$'}{2:-\${'$'}vswap}
+              fi
+              name=\${'$'}(printf '%s' "\${'$'}name" | tr '|\\t\\r\\n' '____')
+              echo "PROC|\${'$'}pid|\${'$'}uid|\${'$'}startticks|\${'$'}name|\${'$'}rss|\${'$'}pss|\${'$'}swap"
+              done_count=\${'$'}((done_count+1))
+              if [ "\${'$'}DETAIL" = "1" ]; then stage="详细 PSS"; else stage="基础扫描"; fi
+              echo "PROGRESS|\${'$'}done_count|\${'$'}total|\${'$'}stage|PID \${'$'}pid"
+            done
+            echo "SCAN_END"
+        """.trimIndent()
+
+        val process = try {
+            ProcessBuilder("su", "-c", script).redirectErrorStream(true).start()
+        } catch (e: Exception) {
+            return ScanResult(null, e.toString(), System.currentTimeMillis() - started)
+        }
+        val lines = java.util.Collections.synchronizedList(mutableListOf<String>())
+        var total = 0
+        val reader = thread(name = "pmm-stream-reader") {
+            try {
+                process.inputStream.bufferedReader().useLines { seq ->
+                    seq.forEach { line ->
+                        if (lines.size < 100000) lines.add(line)
+                        when {
+                            line.startsWith("TOTAL|") -> total = line.substringAfter('|').toIntOrNull() ?: 0
+                            line.startsWith("PROGRESS|") -> {
+                                val fields = line.split('|', limit = 5)
+                                if (fields.size >= 4) {
+                                    onProgress(fields[1].toIntOrNull() ?: 0, total, fields[3], fields.getOrElse(4) { "" })
+                                }
+                            }
+                        }
+                    }
+                }
+            } catch (_: Exception) {}
+        }
+        val finished = process.waitFor(if (detailed) 300 else 120, TimeUnit.SECONDS)
+        if (!finished) {
+            process.destroy()
+            if (process.isAlive) process.destroyForcibly()
+            reader.join(2000)
+            return ScanResult(null, "扫描超过时间限制（详细模式 300 秒 / 快速模式 120 秒）", System.currentTimeMillis() - started)
+        }
+        reader.join(2000)
+        val output = lines.toList()
+        if (process.exitValue() != 0 || "SCAN_END" !in output) {
+            return ScanResult(null, output.takeLast(35).joinToString("\n"), System.currentTimeMillis() - started)
+        }
+        var zram = "不可用"
+        val swaps = StringBuilder()
+        var inSwaps = false
+        val processes = mutableListOf<ProcessItem>()
+        output.forEach { line ->
+            when {
+                line.startsWith("ZRAM|") -> zram = line.substringAfter('|').ifBlank { "不可用" }
+                line == "SWAPS_BEGIN" -> inSwaps = true
+                line == "SWAPS_END" -> inSwaps = false
+                inSwaps -> if (line.isNotBlank()) swaps.append(line).append("; ")
+                line.startsWith("PROC|") -> {
+                    val f = line.split('|', limit = 8)
+                    if (f.size == 8) processes.add(ProcessItem(
+                        f[1].toIntOrNull() ?: 0, f[2].toIntOrNull() ?: 0, f[3], f[4],
+                        f[5].toLongOrNull() ?: 0, f[6].toLongOrNull() ?: -1, f[7].toLongOrNull() ?: 0
+                    ))
+                }
+            }
+        }
+        val time = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US).format(Date())
+        return ScanResult(Snapshot(time, processes, zram, swaps.toString().ifBlank { "不可用" }), "", System.currentTimeMillis() - started)
+    }
+}
+}2} /^Name:/{n=${'2} END{printf "%s|%s|%s|%s",u,r,s,n}' "\${'$'}status" 2>/dev/null)
+              oldifs=\${'$'}IFS
+              IFS='|'
+              set -- \${'$'}vals
+              IFS=\${'$'}oldifs
+              uid=\${'$'}{1:-0}; rss=\${'$'}{2:-0}; vswap=\${'$'}{3:-0}; name=\${'$'}{4:-unknown}
+              case "\${'$'}uid" in ''|*[!0-9]*) uid=0;; esac
+              case "\${'$'}rss" in ''|*[!0-9]*) rss=0;; esac
+              case "\${'$'}vswap" in ''|*[!0-9]*) vswap=0;; esac
+              if [ "\${'$'}INCLUDE_SYSTEM" = "0" ] && [ "\${'$'}uid" -lt 10000 ] 2>/dev/null; then
+                done_count=\${'$'}((done_count+1))
+                echo "PROGRESS|\${'$'}done_count|\${'$'}total|过滤系统进程|PID \${'$'}pid"
+                continue
+              fi
+              statline=\${'$'}(cat "\${'$'}x/stat" 2>/dev/null)
+              startticks=\${'$'}(printf '%s\\n' "\${'$'}statline" | awk '{sub(/^.*\\) /,""); print \${'$'}20}')
+              [ -n "\${'$'}startticks" ] || startticks=0
+              pss=-1
+              swap=\${'$'}vswap
+              if [ "\${'$'}DETAIL" = "1" ] && [ -r "\${'$'}x/smaps" ]; then
+                mem=\${'$'}(awk '/^Pss:/{p+=\${'$'}2} /^Swap:/{s+=\${'$'}2} END{printf "%d|%d",p,s}' "\${'$'}x/smaps" 2>/dev/null)
+                oldifs=\${'$'}IFS; IFS='|'; set -- \${'$'}mem; IFS=\${'$'}oldifs
+                pss=\${'$'}{1:--1}; swap=\${'$'}{2:-\${'$'}vswap}
+              fi
+              name=\${'$'}(printf '%s' "\${'$'}name" | tr '|\\t\\r\\n' '____')
+              echo "PROC|\${'$'}pid|\${'$'}uid|\${'$'}startticks|\${'$'}name|\${'$'}rss|\${'$'}pss|\${'$'}swap"
+              done_count=\${'$'}((done_count+1))
+              if [ "\${'$'}DETAIL" = "1" ]; then stage="详细 PSS"; else stage="基础扫描"; fi
+              echo "PROGRESS|\${'$'}done_count|\${'$'}total|\${'$'}stage|PID \${'$'}pid"
+            done
+            echo "SCAN_END"
+        """.trimIndent()
+
+        val process = try {
+            ProcessBuilder("su", "-c", script).redirectErrorStream(true).start()
+        } catch (e: Exception) {
+            return ScanResult(null, e.toString(), System.currentTimeMillis() - started)
+        }
+        val lines = java.util.Collections.synchronizedList(mutableListOf<String>())
+        var total = 0
+        val reader = thread(name = "pmm-stream-reader") {
+            try {
+                process.inputStream.bufferedReader().useLines { seq ->
+                    seq.forEach { line ->
+                        if (lines.size < 100000) lines.add(line)
+                        when {
+                            line.startsWith("TOTAL|") -> total = line.substringAfter('|').toIntOrNull() ?: 0
+                            line.startsWith("PROGRESS|") -> {
+                                val fields = line.split('|', limit = 5)
+                                if (fields.size >= 4) {
+                                    onProgress(fields[1].toIntOrNull() ?: 0, total, fields[3], fields.getOrElse(4) { "" })
+                                }
+                            }
+                        }
+                    }
+                }
+            } catch (_: Exception) {}
+        }
+        val finished = process.waitFor(if (detailed) 300 else 120, TimeUnit.SECONDS)
+        if (!finished) {
+            process.destroy()
+            if (process.isAlive) process.destroyForcibly()
+            reader.join(2000)
+            return ScanResult(null, "扫描超过时间限制（详细模式 300 秒 / 快速模式 120 秒）", System.currentTimeMillis() - started)
+        }
+        reader.join(2000)
+        val output = lines.toList()
+        if (process.exitValue() != 0 || "SCAN_END" !in output) {
+            return ScanResult(null, output.takeLast(35).joinToString("\n"), System.currentTimeMillis() - started)
+        }
+        var zram = "不可用"
+        val swaps = StringBuilder()
+        var inSwaps = false
+        val processes = mutableListOf<ProcessItem>()
+        output.forEach { line ->
+            when {
+                line.startsWith("ZRAM|") -> zram = line.substringAfter('|').ifBlank { "不可用" }
+                line == "SWAPS_BEGIN" -> inSwaps = true
+                line == "SWAPS_END" -> inSwaps = false
+                inSwaps -> if (line.isNotBlank()) swaps.append(line).append("; ")
+                line.startsWith("PROC|") -> {
+                    val f = line.split('|', limit = 8)
+                    if (f.size == 8) processes.add(ProcessItem(
+                        f[1].toIntOrNull() ?: 0, f[2].toIntOrNull() ?: 0, f[3], f[4],
+                        f[5].toLongOrNull() ?: 0, f[6].toLongOrNull() ?: -1, f[7].toLongOrNull() ?: 0
+                    ))
+                }
+            }
+        }
+        val time = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US).format(Date())
+        return ScanResult(Snapshot(time, processes, zram, swaps.toString().ifBlank { "不可用" }), "", System.currentTimeMillis() - started)
+    }
+}
+}2} END{printf "%s|%s|%s|%s",u,r,s,n}' "${'status" 2>/dev/null)
+              oldifs=\${'$'}IFS
+              IFS='|'
+              set -- \${'$'}vals
+              IFS=\${'$'}oldifs
+              uid=\${'$'}{1:-0}; rss=\${'$'}{2:-0}; vswap=\${'$'}{3:-0}; name=\${'$'}{4:-unknown}
+              case "\${'$'}uid" in ''|*[!0-9]*) uid=0;; esac
+              case "\${'$'}rss" in ''|*[!0-9]*) rss=0;; esac
+              case "\${'$'}vswap" in ''|*[!0-9]*) vswap=0;; esac
+              if [ "\${'$'}INCLUDE_SYSTEM" = "0" ] && [ "\${'$'}uid" -lt 10000 ] 2>/dev/null; then
+                done_count=\${'$'}((done_count+1))
+                echo "PROGRESS|\${'$'}done_count|\${'$'}total|过滤系统进程|PID \${'$'}pid"
+                continue
+              fi
+              statline=\${'$'}(cat "\${'$'}x/stat" 2>/dev/null)
+              startticks=\${'$'}(printf '%s\\n' "\${'$'}statline" | awk '{sub(/^.*\\) /,""); print \${'$'}20}')
+              [ -n "\${'$'}startticks" ] || startticks=0
+              pss=-1
+              swap=\${'$'}vswap
+              if [ "\${'$'}DETAIL" = "1" ] && [ -r "\${'$'}x/smaps" ]; then
+                mem=\${'$'}(awk '/^Pss:/{p+=\${'$'}2} /^Swap:/{s+=\${'$'}2} END{printf "%d|%d",p,s}' "\${'$'}x/smaps" 2>/dev/null)
+                oldifs=\${'$'}IFS; IFS='|'; set -- \${'$'}mem; IFS=\${'$'}oldifs
+                pss=\${'$'}{1:--1}; swap=\${'$'}{2:-\${'$'}vswap}
+              fi
+              name=\${'$'}(printf '%s' "\${'$'}name" | tr '|\\t\\r\\n' '____')
+              echo "PROC|\${'$'}pid|\${'$'}uid|\${'$'}startticks|\${'$'}name|\${'$'}rss|\${'$'}pss|\${'$'}swap"
+              done_count=\${'$'}((done_count+1))
+              if [ "\${'$'}DETAIL" = "1" ]; then stage="详细 PSS"; else stage="基础扫描"; fi
+              echo "PROGRESS|\${'$'}done_count|\${'$'}total|\${'$'}stage|PID \${'$'}pid"
+            done
+            echo "SCAN_END"
+        """.trimIndent()
+
+        val process = try {
+            ProcessBuilder("su", "-c", script).redirectErrorStream(true).start()
+        } catch (e: Exception) {
+            return ScanResult(null, e.toString(), System.currentTimeMillis() - started)
+        }
+        val lines = java.util.Collections.synchronizedList(mutableListOf<String>())
+        var total = 0
+        val reader = thread(name = "pmm-stream-reader") {
+            try {
+                process.inputStream.bufferedReader().useLines { seq ->
+                    seq.forEach { line ->
+                        if (lines.size < 100000) lines.add(line)
+                        when {
+                            line.startsWith("TOTAL|") -> total = line.substringAfter('|').toIntOrNull() ?: 0
+                            line.startsWith("PROGRESS|") -> {
+                                val fields = line.split('|', limit = 5)
+                                if (fields.size >= 4) {
+                                    onProgress(fields[1].toIntOrNull() ?: 0, total, fields[3], fields.getOrElse(4) { "" })
+                                }
+                            }
+                        }
+                    }
+                }
+            } catch (_: Exception) {}
+        }
+        val finished = process.waitFor(if (detailed) 300 else 120, TimeUnit.SECONDS)
+        if (!finished) {
+            process.destroy()
+            if (process.isAlive) process.destroyForcibly()
+            reader.join(2000)
+            return ScanResult(null, "扫描超过时间限制（详细模式 300 秒 / 快速模式 120 秒）", System.currentTimeMillis() - started)
+        }
+        reader.join(2000)
+        val output = lines.toList()
+        if (process.exitValue() != 0 || "SCAN_END" !in output) {
+            return ScanResult(null, output.takeLast(35).joinToString("\n"), System.currentTimeMillis() - started)
+        }
+        var zram = "不可用"
+        val swaps = StringBuilder()
+        var inSwaps = false
+        val processes = mutableListOf<ProcessItem>()
+        output.forEach { line ->
+            when {
+                line.startsWith("ZRAM|") -> zram = line.substringAfter('|').ifBlank { "不可用" }
+                line == "SWAPS_BEGIN" -> inSwaps = true
+                line == "SWAPS_END" -> inSwaps = false
+                inSwaps -> if (line.isNotBlank()) swaps.append(line).append("; ")
+                line.startsWith("PROC|") -> {
+                    val f = line.split('|', limit = 8)
+                    if (f.size == 8) processes.add(ProcessItem(
+                        f[1].toIntOrNull() ?: 0, f[2].toIntOrNull() ?: 0, f[3], f[4],
+                        f[5].toLongOrNull() ?: 0, f[6].toLongOrNull() ?: -1, f[7].toLongOrNull() ?: 0
+                    ))
+                }
+            }
+        }
+        val time = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US).format(Date())
+        return ScanResult(Snapshot(time, processes, zram, swaps.toString().ifBlank { "不可用" }), "", System.currentTimeMillis() - started)
+    }
+}
+}status" 2>/dev/null)
+              oldifs=${'IFS
+              IFS='|'
+              set -- \${'$'}vals
+              IFS=\${'$'}oldifs
+              uid=\${'$'}{1:-0}; rss=\${'$'}{2:-0}; vswap=\${'$'}{3:-0}; name=\${'$'}{4:-unknown}
+              case "\${'$'}uid" in ''|*[!0-9]*) uid=0;; esac
+              case "\${'$'}rss" in ''|*[!0-9]*) rss=0;; esac
+              case "\${'$'}vswap" in ''|*[!0-9]*) vswap=0;; esac
+              if [ "\${'$'}INCLUDE_SYSTEM" = "0" ] && [ "\${'$'}uid" -lt 10000 ] 2>/dev/null; then
+                done_count=\${'$'}((done_count+1))
+                echo "PROGRESS|\${'$'}done_count|\${'$'}total|过滤系统进程|PID \${'$'}pid"
+                continue
+              fi
+              statline=\${'$'}(cat "\${'$'}x/stat" 2>/dev/null)
+              startticks=\${'$'}(printf '%s\\n' "\${'$'}statline" | awk '{sub(/^.*\\) /,""); print \${'$'}20}')
+              [ -n "\${'$'}startticks" ] || startticks=0
+              pss=-1
+              swap=\${'$'}vswap
+              if [ "\${'$'}DETAIL" = "1" ] && [ -r "\${'$'}x/smaps" ]; then
+                mem=\${'$'}(awk '/^Pss:/{p+=\${'$'}2} /^Swap:/{s+=\${'$'}2} END{printf "%d|%d",p,s}' "\${'$'}x/smaps" 2>/dev/null)
+                oldifs=\${'$'}IFS; IFS='|'; set -- \${'$'}mem; IFS=\${'$'}oldifs
+                pss=\${'$'}{1:--1}; swap=\${'$'}{2:-\${'$'}vswap}
+              fi
+              name=\${'$'}(printf '%s' "\${'$'}name" | tr '|\\t\\r\\n' '____')
+              echo "PROC|\${'$'}pid|\${'$'}uid|\${'$'}startticks|\${'$'}name|\${'$'}rss|\${'$'}pss|\${'$'}swap"
+              done_count=\${'$'}((done_count+1))
+              if [ "\${'$'}DETAIL" = "1" ]; then stage="详细 PSS"; else stage="基础扫描"; fi
+              echo "PROGRESS|\${'$'}done_count|\${'$'}total|\${'$'}stage|PID \${'$'}pid"
+            done
+            echo "SCAN_END"
+        """.trimIndent()
+
+        val process = try {
+            ProcessBuilder("su", "-c", script).redirectErrorStream(true).start()
+        } catch (e: Exception) {
+            return ScanResult(null, e.toString(), System.currentTimeMillis() - started)
+        }
+        val lines = java.util.Collections.synchronizedList(mutableListOf<String>())
+        var total = 0
+        val reader = thread(name = "pmm-stream-reader") {
+            try {
+                process.inputStream.bufferedReader().useLines { seq ->
+                    seq.forEach { line ->
+                        if (lines.size < 100000) lines.add(line)
+                        when {
+                            line.startsWith("TOTAL|") -> total = line.substringAfter('|').toIntOrNull() ?: 0
+                            line.startsWith("PROGRESS|") -> {
+                                val fields = line.split('|', limit = 5)
+                                if (fields.size >= 4) {
+                                    onProgress(fields[1].toIntOrNull() ?: 0, total, fields[3], fields.getOrElse(4) { "" })
+                                }
+                            }
+                        }
+                    }
+                }
+            } catch (_: Exception) {}
+        }
+        val finished = process.waitFor(if (detailed) 300 else 120, TimeUnit.SECONDS)
+        if (!finished) {
+            process.destroy()
+            if (process.isAlive) process.destroyForcibly()
+            reader.join(2000)
+            return ScanResult(null, "扫描超过时间限制（详细模式 300 秒 / 快速模式 120 秒）", System.currentTimeMillis() - started)
+        }
+        reader.join(2000)
+        val output = lines.toList()
+        if (process.exitValue() != 0 || "SCAN_END" !in output) {
+            return ScanResult(null, output.takeLast(35).joinToString("\n"), System.currentTimeMillis() - started)
+        }
+        var zram = "不可用"
+        val swaps = StringBuilder()
+        var inSwaps = false
+        val processes = mutableListOf<ProcessItem>()
+        output.forEach { line ->
+            when {
+                line.startsWith("ZRAM|") -> zram = line.substringAfter('|').ifBlank { "不可用" }
+                line == "SWAPS_BEGIN" -> inSwaps = true
+                line == "SWAPS_END" -> inSwaps = false
+                inSwaps -> if (line.isNotBlank()) swaps.append(line).append("; ")
+                line.startsWith("PROC|") -> {
+                    val f = line.split('|', limit = 8)
+                    if (f.size == 8) processes.add(ProcessItem(
+                        f[1].toIntOrNull() ?: 0, f[2].toIntOrNull() ?: 0, f[3], f[4],
+                        f[5].toLongOrNull() ?: 0, f[6].toLongOrNull() ?: -1, f[7].toLongOrNull() ?: 0
+                    ))
+                }
+            }
+        }
+        val time = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US).format(Date())
+        return ScanResult(Snapshot(time, processes, zram, swaps.toString().ifBlank { "不可用" }), "", System.currentTimeMillis() - started)
+    }
+}
+}IFS
+              IFS='|'
+              set -- ${'vals
+              IFS=\${'$'}oldifs
+              uid=\${'$'}{1:-0}; rss=\${'$'}{2:-0}; vswap=\${'$'}{3:-0}; name=\${'$'}{4:-unknown}
+              case "\${'$'}uid" in ''|*[!0-9]*) uid=0;; esac
+              case "\${'$'}rss" in ''|*[!0-9]*) rss=0;; esac
+              case "\${'$'}vswap" in ''|*[!0-9]*) vswap=0;; esac
+              if [ "\${'$'}INCLUDE_SYSTEM" = "0" ] && [ "\${'$'}uid" -lt 10000 ] 2>/dev/null; then
+                done_count=\${'$'}((done_count+1))
+                echo "PROGRESS|\${'$'}done_count|\${'$'}total|过滤系统进程|PID \${'$'}pid"
+                continue
+              fi
+              statline=\${'$'}(cat "\${'$'}x/stat" 2>/dev/null)
+              startticks=\${'$'}(printf '%s\\n' "\${'$'}statline" | awk '{sub(/^.*\\) /,""); print \${'$'}20}')
+              [ -n "\${'$'}startticks" ] || startticks=0
+              pss=-1
+              swap=\${'$'}vswap
+              if [ "\${'$'}DETAIL" = "1" ] && [ -r "\${'$'}x/smaps" ]; then
+                mem=\${'$'}(awk '/^Pss:/{p+=\${'$'}2} /^Swap:/{s+=\${'$'}2} END{printf "%d|%d",p,s}' "\${'$'}x/smaps" 2>/dev/null)
+                oldifs=\${'$'}IFS; IFS='|'; set -- \${'$'}mem; IFS=\${'$'}oldifs
+                pss=\${'$'}{1:--1}; swap=\${'$'}{2:-\${'$'}vswap}
+              fi
+              name=\${'$'}(printf '%s' "\${'$'}name" | tr '|\\t\\r\\n' '____')
+              echo "PROC|\${'$'}pid|\${'$'}uid|\${'$'}startticks|\${'$'}name|\${'$'}rss|\${'$'}pss|\${'$'}swap"
+              done_count=\${'$'}((done_count+1))
+              if [ "\${'$'}DETAIL" = "1" ]; then stage="详细 PSS"; else stage="基础扫描"; fi
+              echo "PROGRESS|\${'$'}done_count|\${'$'}total|\${'$'}stage|PID \${'$'}pid"
+            done
+            echo "SCAN_END"
+        """.trimIndent()
+
+        val process = try {
+            ProcessBuilder("su", "-c", script).redirectErrorStream(true).start()
+        } catch (e: Exception) {
+            return ScanResult(null, e.toString(), System.currentTimeMillis() - started)
+        }
+        val lines = java.util.Collections.synchronizedList(mutableListOf<String>())
+        var total = 0
+        val reader = thread(name = "pmm-stream-reader") {
+            try {
+                process.inputStream.bufferedReader().useLines { seq ->
+                    seq.forEach { line ->
+                        if (lines.size < 100000) lines.add(line)
+                        when {
+                            line.startsWith("TOTAL|") -> total = line.substringAfter('|').toIntOrNull() ?: 0
+                            line.startsWith("PROGRESS|") -> {
+                                val fields = line.split('|', limit = 5)
+                                if (fields.size >= 4) {
+                                    onProgress(fields[1].toIntOrNull() ?: 0, total, fields[3], fields.getOrElse(4) { "" })
+                                }
+                            }
+                        }
+                    }
+                }
+            } catch (_: Exception) {}
+        }
+        val finished = process.waitFor(if (detailed) 300 else 120, TimeUnit.SECONDS)
+        if (!finished) {
+            process.destroy()
+            if (process.isAlive) process.destroyForcibly()
+            reader.join(2000)
+            return ScanResult(null, "扫描超过时间限制（详细模式 300 秒 / 快速模式 120 秒）", System.currentTimeMillis() - started)
+        }
+        reader.join(2000)
+        val output = lines.toList()
+        if (process.exitValue() != 0 || "SCAN_END" !in output) {
+            return ScanResult(null, output.takeLast(35).joinToString("\n"), System.currentTimeMillis() - started)
+        }
+        var zram = "不可用"
+        val swaps = StringBuilder()
+        var inSwaps = false
+        val processes = mutableListOf<ProcessItem>()
+        output.forEach { line ->
+            when {
+                line.startsWith("ZRAM|") -> zram = line.substringAfter('|').ifBlank { "不可用" }
+                line == "SWAPS_BEGIN" -> inSwaps = true
+                line == "SWAPS_END" -> inSwaps = false
+                inSwaps -> if (line.isNotBlank()) swaps.append(line).append("; ")
+                line.startsWith("PROC|") -> {
+                    val f = line.split('|', limit = 8)
+                    if (f.size == 8) processes.add(ProcessItem(
+                        f[1].toIntOrNull() ?: 0, f[2].toIntOrNull() ?: 0, f[3], f[4],
+                        f[5].toLongOrNull() ?: 0, f[6].toLongOrNull() ?: -1, f[7].toLongOrNull() ?: 0
+                    ))
+                }
+            }
+        }
+        val time = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US).format(Date())
+        return ScanResult(Snapshot(time, processes, zram, swaps.toString().ifBlank { "不可用" }), "", System.currentTimeMillis() - started)
+    }
+}
+}vals
+              IFS=${'oldifs
+              uid=\${'$'}{1:-0}; rss=\${'$'}{2:-0}; vswap=\${'$'}{3:-0}; name=\${'$'}{4:-unknown}
+              case "\${'$'}uid" in ''|*[!0-9]*) uid=0;; esac
+              case "\${'$'}rss" in ''|*[!0-9]*) rss=0;; esac
+              case "\${'$'}vswap" in ''|*[!0-9]*) vswap=0;; esac
+              if [ "\${'$'}INCLUDE_SYSTEM" = "0" ] && [ "\${'$'}uid" -lt 10000 ] 2>/dev/null; then
+                done_count=\${'$'}((done_count+1))
+                echo "PROGRESS|\${'$'}done_count|\${'$'}total|过滤系统进程|PID \${'$'}pid"
+                continue
+              fi
+              statline=\${'$'}(cat "\${'$'}x/stat" 2>/dev/null)
+              startticks=\${'$'}(printf '%s\\n' "\${'$'}statline" | awk '{sub(/^.*\\) /,""); print \${'$'}20}')
+              [ -n "\${'$'}startticks" ] || startticks=0
+              pss=-1
+              swap=\${'$'}vswap
+              if [ "\${'$'}DETAIL" = "1" ] && [ -r "\${'$'}x/smaps" ]; then
+                mem=\${'$'}(awk '/^Pss:/{p+=\${'$'}2} /^Swap:/{s+=\${'$'}2} END{printf "%d|%d",p,s}' "\${'$'}x/smaps" 2>/dev/null)
+                oldifs=\${'$'}IFS; IFS='|'; set -- \${'$'}mem; IFS=\${'$'}oldifs
+                pss=\${'$'}{1:--1}; swap=\${'$'}{2:-\${'$'}vswap}
+              fi
+              name=\${'$'}(printf '%s' "\${'$'}name" | tr '|\\t\\r\\n' '____')
+              echo "PROC|\${'$'}pid|\${'$'}uid|\${'$'}startticks|\${'$'}name|\${'$'}rss|\${'$'}pss|\${'$'}swap"
+              done_count=\${'$'}((done_count+1))
+              if [ "\${'$'}DETAIL" = "1" ]; then stage="详细 PSS"; else stage="基础扫描"; fi
+              echo "PROGRESS|\${'$'}done_count|\${'$'}total|\${'$'}stage|PID \${'$'}pid"
+            done
+            echo "SCAN_END"
+        """.trimIndent()
+
+        val process = try {
+            ProcessBuilder("su", "-c", script).redirectErrorStream(true).start()
+        } catch (e: Exception) {
+            return ScanResult(null, e.toString(), System.currentTimeMillis() - started)
+        }
+        val lines = java.util.Collections.synchronizedList(mutableListOf<String>())
+        var total = 0
+        val reader = thread(name = "pmm-stream-reader") {
+            try {
+                process.inputStream.bufferedReader().useLines { seq ->
+                    seq.forEach { line ->
+                        if (lines.size < 100000) lines.add(line)
+                        when {
+                            line.startsWith("TOTAL|") -> total = line.substringAfter('|').toIntOrNull() ?: 0
+                            line.startsWith("PROGRESS|") -> {
+                                val fields = line.split('|', limit = 5)
+                                if (fields.size >= 4) {
+                                    onProgress(fields[1].toIntOrNull() ?: 0, total, fields[3], fields.getOrElse(4) { "" })
+                                }
+                            }
+                        }
+                    }
+                }
+            } catch (_: Exception) {}
+        }
+        val finished = process.waitFor(if (detailed) 300 else 120, TimeUnit.SECONDS)
+        if (!finished) {
+            process.destroy()
+            if (process.isAlive) process.destroyForcibly()
+            reader.join(2000)
+            return ScanResult(null, "扫描超过时间限制（详细模式 300 秒 / 快速模式 120 秒）", System.currentTimeMillis() - started)
+        }
+        reader.join(2000)
+        val output = lines.toList()
+        if (process.exitValue() != 0 || "SCAN_END" !in output) {
+            return ScanResult(null, output.takeLast(35).joinToString("\n"), System.currentTimeMillis() - started)
+        }
+        var zram = "不可用"
+        val swaps = StringBuilder()
+        var inSwaps = false
+        val processes = mutableListOf<ProcessItem>()
+        output.forEach { line ->
+            when {
+                line.startsWith("ZRAM|") -> zram = line.substringAfter('|').ifBlank { "不可用" }
+                line == "SWAPS_BEGIN" -> inSwaps = true
+                line == "SWAPS_END" -> inSwaps = false
+                inSwaps -> if (line.isNotBlank()) swaps.append(line).append("; ")
+                line.startsWith("PROC|") -> {
+                    val f = line.split('|', limit = 8)
+                    if (f.size == 8) processes.add(ProcessItem(
+                        f[1].toIntOrNull() ?: 0, f[2].toIntOrNull() ?: 0, f[3], f[4],
+                        f[5].toLongOrNull() ?: 0, f[6].toLongOrNull() ?: -1, f[7].toLongOrNull() ?: 0
+                    ))
+                }
+            }
+        }
+        val time = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US).format(Date())
+        return ScanResult(Snapshot(time, processes, zram, swaps.toString().ifBlank { "不可用" }), "", System.currentTimeMillis() - started)
+    }
+}
+}oldifs
+              uid=${'{1:-0}; rss=\${'$'}{2:-0}; vswap=\${'$'}{3:-0}; name=\${'$'}{4:-unknown}
+              case "\${'$'}uid" in ''|*[!0-9]*) uid=0;; esac
+              case "\${'$'}rss" in ''|*[!0-9]*) rss=0;; esac
+              case "\${'$'}vswap" in ''|*[!0-9]*) vswap=0;; esac
+              if [ "\${'$'}INCLUDE_SYSTEM" = "0" ] && [ "\${'$'}uid" -lt 10000 ] 2>/dev/null; then
+                done_count=\${'$'}((done_count+1))
+                echo "PROGRESS|\${'$'}done_count|\${'$'}total|过滤系统进程|PID \${'$'}pid"
+                continue
+              fi
+              statline=\${'$'}(cat "\${'$'}x/stat" 2>/dev/null)
+              startticks=\${'$'}(printf '%s\\n' "\${'$'}statline" | awk '{sub(/^.*\\) /,""); print \${'$'}20}')
+              [ -n "\${'$'}startticks" ] || startticks=0
+              pss=-1
+              swap=\${'$'}vswap
+              if [ "\${'$'}DETAIL" = "1" ] && [ -r "\${'$'}x/smaps" ]; then
+                mem=\${'$'}(awk '/^Pss:/{p+=\${'$'}2} /^Swap:/{s+=\${'$'}2} END{printf "%d|%d",p,s}' "\${'$'}x/smaps" 2>/dev/null)
+                oldifs=\${'$'}IFS; IFS='|'; set -- \${'$'}mem; IFS=\${'$'}oldifs
+                pss=\${'$'}{1:--1}; swap=\${'$'}{2:-\${'$'}vswap}
+              fi
+              name=\${'$'}(printf '%s' "\${'$'}name" | tr '|\\t\\r\\n' '____')
+              echo "PROC|\${'$'}pid|\${'$'}uid|\${'$'}startticks|\${'$'}name|\${'$'}rss|\${'$'}pss|\${'$'}swap"
+              done_count=\${'$'}((done_count+1))
+              if [ "\${'$'}DETAIL" = "1" ]; then stage="详细 PSS"; else stage="基础扫描"; fi
+              echo "PROGRESS|\${'$'}done_count|\${'$'}total|\${'$'}stage|PID \${'$'}pid"
+            done
+            echo "SCAN_END"
+        """.trimIndent()
+
+        val process = try {
+            ProcessBuilder("su", "-c", script).redirectErrorStream(true).start()
+        } catch (e: Exception) {
+            return ScanResult(null, e.toString(), System.currentTimeMillis() - started)
+        }
+        val lines = java.util.Collections.synchronizedList(mutableListOf<String>())
+        var total = 0
+        val reader = thread(name = "pmm-stream-reader") {
+            try {
+                process.inputStream.bufferedReader().useLines { seq ->
+                    seq.forEach { line ->
+                        if (lines.size < 100000) lines.add(line)
+                        when {
+                            line.startsWith("TOTAL|") -> total = line.substringAfter('|').toIntOrNull() ?: 0
+                            line.startsWith("PROGRESS|") -> {
+                                val fields = line.split('|', limit = 5)
+                                if (fields.size >= 4) {
+                                    onProgress(fields[1].toIntOrNull() ?: 0, total, fields[3], fields.getOrElse(4) { "" })
+                                }
+                            }
+                        }
+                    }
+                }
+            } catch (_: Exception) {}
+        }
+        val finished = process.waitFor(if (detailed) 300 else 120, TimeUnit.SECONDS)
+        if (!finished) {
+            process.destroy()
+            if (process.isAlive) process.destroyForcibly()
+            reader.join(2000)
+            return ScanResult(null, "扫描超过时间限制（详细模式 300 秒 / 快速模式 120 秒）", System.currentTimeMillis() - started)
+        }
+        reader.join(2000)
+        val output = lines.toList()
+        if (process.exitValue() != 0 || "SCAN_END" !in output) {
+            return ScanResult(null, output.takeLast(35).joinToString("\n"), System.currentTimeMillis() - started)
+        }
+        var zram = "不可用"
+        val swaps = StringBuilder()
+        var inSwaps = false
+        val processes = mutableListOf<ProcessItem>()
+        output.forEach { line ->
+            when {
+                line.startsWith("ZRAM|") -> zram = line.substringAfter('|').ifBlank { "不可用" }
+                line == "SWAPS_BEGIN" -> inSwaps = true
+                line == "SWAPS_END" -> inSwaps = false
+                inSwaps -> if (line.isNotBlank()) swaps.append(line).append("; ")
+                line.startsWith("PROC|") -> {
+                    val f = line.split('|', limit = 8)
+                    if (f.size == 8) processes.add(ProcessItem(
+                        f[1].toIntOrNull() ?: 0, f[2].toIntOrNull() ?: 0, f[3], f[4],
+                        f[5].toLongOrNull() ?: 0, f[6].toLongOrNull() ?: -1, f[7].toLongOrNull() ?: 0
+                    ))
+                }
+            }
+        }
+        val time = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US).format(Date())
+        return ScanResult(Snapshot(time, processes, zram, swaps.toString().ifBlank { "不可用" }), "", System.currentTimeMillis() - started)
+    }
+}
+}{1:-0}; rss=${'{2:-0}; vswap=\${'$'}{3:-0}; name=\${'$'}{4:-unknown}
+              case "\${'$'}uid" in ''|*[!0-9]*) uid=0;; esac
+              case "\${'$'}rss" in ''|*[!0-9]*) rss=0;; esac
+              case "\${'$'}vswap" in ''|*[!0-9]*) vswap=0;; esac
+              if [ "\${'$'}INCLUDE_SYSTEM" = "0" ] && [ "\${'$'}uid" -lt 10000 ] 2>/dev/null; then
+                done_count=\${'$'}((done_count+1))
+                echo "PROGRESS|\${'$'}done_count|\${'$'}total|过滤系统进程|PID \${'$'}pid"
+                continue
+              fi
+              statline=\${'$'}(cat "\${'$'}x/stat" 2>/dev/null)
+              startticks=\${'$'}(printf '%s\\n' "\${'$'}statline" | awk '{sub(/^.*\\) /,""); print \${'$'}20}')
+              [ -n "\${'$'}startticks" ] || startticks=0
+              pss=-1
+              swap=\${'$'}vswap
+              if [ "\${'$'}DETAIL" = "1" ] && [ -r "\${'$'}x/smaps" ]; then
+                mem=\${'$'}(awk '/^Pss:/{p+=\${'$'}2} /^Swap:/{s+=\${'$'}2} END{printf "%d|%d",p,s}' "\${'$'}x/smaps" 2>/dev/null)
+                oldifs=\${'$'}IFS; IFS='|'; set -- \${'$'}mem; IFS=\${'$'}oldifs
+                pss=\${'$'}{1:--1}; swap=\${'$'}{2:-\${'$'}vswap}
+              fi
+              name=\${'$'}(printf '%s' "\${'$'}name" | tr '|\\t\\r\\n' '____')
+              echo "PROC|\${'$'}pid|\${'$'}uid|\${'$'}startticks|\${'$'}name|\${'$'}rss|\${'$'}pss|\${'$'}swap"
+              done_count=\${'$'}((done_count+1))
+              if [ "\${'$'}DETAIL" = "1" ]; then stage="详细 PSS"; else stage="基础扫描"; fi
+              echo "PROGRESS|\${'$'}done_count|\${'$'}total|\${'$'}stage|PID \${'$'}pid"
+            done
+            echo "SCAN_END"
+        """.trimIndent()
+
+        val process = try {
+            ProcessBuilder("su", "-c", script).redirectErrorStream(true).start()
+        } catch (e: Exception) {
+            return ScanResult(null, e.toString(), System.currentTimeMillis() - started)
+        }
+        val lines = java.util.Collections.synchronizedList(mutableListOf<String>())
+        var total = 0
+        val reader = thread(name = "pmm-stream-reader") {
+            try {
+                process.inputStream.bufferedReader().useLines { seq ->
+                    seq.forEach { line ->
+                        if (lines.size < 100000) lines.add(line)
+                        when {
+                            line.startsWith("TOTAL|") -> total = line.substringAfter('|').toIntOrNull() ?: 0
+                            line.startsWith("PROGRESS|") -> {
+                                val fields = line.split('|', limit = 5)
+                                if (fields.size >= 4) {
+                                    onProgress(fields[1].toIntOrNull() ?: 0, total, fields[3], fields.getOrElse(4) { "" })
+                                }
+                            }
+                        }
+                    }
+                }
+            } catch (_: Exception) {}
+        }
+        val finished = process.waitFor(if (detailed) 300 else 120, TimeUnit.SECONDS)
+        if (!finished) {
+            process.destroy()
+            if (process.isAlive) process.destroyForcibly()
+            reader.join(2000)
+            return ScanResult(null, "扫描超过时间限制（详细模式 300 秒 / 快速模式 120 秒）", System.currentTimeMillis() - started)
+        }
+        reader.join(2000)
+        val output = lines.toList()
+        if (process.exitValue() != 0 || "SCAN_END" !in output) {
+            return ScanResult(null, output.takeLast(35).joinToString("\n"), System.currentTimeMillis() - started)
+        }
+        var zram = "不可用"
+        val swaps = StringBuilder()
+        var inSwaps = false
+        val processes = mutableListOf<ProcessItem>()
+        output.forEach { line ->
+            when {
+                line.startsWith("ZRAM|") -> zram = line.substringAfter('|').ifBlank { "不可用" }
+                line == "SWAPS_BEGIN" -> inSwaps = true
+                line == "SWAPS_END" -> inSwaps = false
+                inSwaps -> if (line.isNotBlank()) swaps.append(line).append("; ")
+                line.startsWith("PROC|") -> {
+                    val f = line.split('|', limit = 8)
+                    if (f.size == 8) processes.add(ProcessItem(
+                        f[1].toIntOrNull() ?: 0, f[2].toIntOrNull() ?: 0, f[3], f[4],
+                        f[5].toLongOrNull() ?: 0, f[6].toLongOrNull() ?: -1, f[7].toLongOrNull() ?: 0
+                    ))
+                }
+            }
+        }
+        val time = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US).format(Date())
+        return ScanResult(Snapshot(time, processes, zram, swaps.toString().ifBlank { "不可用" }), "", System.currentTimeMillis() - started)
+    }
+}
+}{2:-0}; vswap=${'{3:-0}; name=\${'$'}{4:-unknown}
+              case "\${'$'}uid" in ''|*[!0-9]*) uid=0;; esac
+              case "\${'$'}rss" in ''|*[!0-9]*) rss=0;; esac
+              case "\${'$'}vswap" in ''|*[!0-9]*) vswap=0;; esac
+              if [ "\${'$'}INCLUDE_SYSTEM" = "0" ] && [ "\${'$'}uid" -lt 10000 ] 2>/dev/null; then
+                done_count=\${'$'}((done_count+1))
+                echo "PROGRESS|\${'$'}done_count|\${'$'}total|过滤系统进程|PID \${'$'}pid"
+                continue
+              fi
+              statline=\${'$'}(cat "\${'$'}x/stat" 2>/dev/null)
+              startticks=\${'$'}(printf '%s\\n' "\${'$'}statline" | awk '{sub(/^.*\\) /,""); print \${'$'}20}')
+              [ -n "\${'$'}startticks" ] || startticks=0
+              pss=-1
+              swap=\${'$'}vswap
+              if [ "\${'$'}DETAIL" = "1" ] && [ -r "\${'$'}x/smaps" ]; then
+                mem=\${'$'}(awk '/^Pss:/{p+=\${'$'}2} /^Swap:/{s+=\${'$'}2} END{printf "%d|%d",p,s}' "\${'$'}x/smaps" 2>/dev/null)
+                oldifs=\${'$'}IFS; IFS='|'; set -- \${'$'}mem; IFS=\${'$'}oldifs
+                pss=\${'$'}{1:--1}; swap=\${'$'}{2:-\${'$'}vswap}
+              fi
+              name=\${'$'}(printf '%s' "\${'$'}name" | tr '|\\t\\r\\n' '____')
+              echo "PROC|\${'$'}pid|\${'$'}uid|\${'$'}startticks|\${'$'}name|\${'$'}rss|\${'$'}pss|\${'$'}swap"
+              done_count=\${'$'}((done_count+1))
+              if [ "\${'$'}DETAIL" = "1" ]; then stage="详细 PSS"; else stage="基础扫描"; fi
+              echo "PROGRESS|\${'$'}done_count|\${'$'}total|\${'$'}stage|PID \${'$'}pid"
+            done
+            echo "SCAN_END"
+        """.trimIndent()
+
+        val process = try {
+            ProcessBuilder("su", "-c", script).redirectErrorStream(true).start()
+        } catch (e: Exception) {
+            return ScanResult(null, e.toString(), System.currentTimeMillis() - started)
+        }
+        val lines = java.util.Collections.synchronizedList(mutableListOf<String>())
+        var total = 0
+        val reader = thread(name = "pmm-stream-reader") {
+            try {
+                process.inputStream.bufferedReader().useLines { seq ->
+                    seq.forEach { line ->
+                        if (lines.size < 100000) lines.add(line)
+                        when {
+                            line.startsWith("TOTAL|") -> total = line.substringAfter('|').toIntOrNull() ?: 0
+                            line.startsWith("PROGRESS|") -> {
+                                val fields = line.split('|', limit = 5)
+                                if (fields.size >= 4) {
+                                    onProgress(fields[1].toIntOrNull() ?: 0, total, fields[3], fields.getOrElse(4) { "" })
+                                }
+                            }
+                        }
+                    }
+                }
+            } catch (_: Exception) {}
+        }
+        val finished = process.waitFor(if (detailed) 300 else 120, TimeUnit.SECONDS)
+        if (!finished) {
+            process.destroy()
+            if (process.isAlive) process.destroyForcibly()
+            reader.join(2000)
+            return ScanResult(null, "扫描超过时间限制（详细模式 300 秒 / 快速模式 120 秒）", System.currentTimeMillis() - started)
+        }
+        reader.join(2000)
+        val output = lines.toList()
+        if (process.exitValue() != 0 || "SCAN_END" !in output) {
+            return ScanResult(null, output.takeLast(35).joinToString("\n"), System.currentTimeMillis() - started)
+        }
+        var zram = "不可用"
+        val swaps = StringBuilder()
+        var inSwaps = false
+        val processes = mutableListOf<ProcessItem>()
+        output.forEach { line ->
+            when {
+                line.startsWith("ZRAM|") -> zram = line.substringAfter('|').ifBlank { "不可用" }
+                line == "SWAPS_BEGIN" -> inSwaps = true
+                line == "SWAPS_END" -> inSwaps = false
+                inSwaps -> if (line.isNotBlank()) swaps.append(line).append("; ")
+                line.startsWith("PROC|") -> {
+                    val f = line.split('|', limit = 8)
+                    if (f.size == 8) processes.add(ProcessItem(
+                        f[1].toIntOrNull() ?: 0, f[2].toIntOrNull() ?: 0, f[3], f[4],
+                        f[5].toLongOrNull() ?: 0, f[6].toLongOrNull() ?: -1, f[7].toLongOrNull() ?: 0
+                    ))
+                }
+            }
+        }
+        val time = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US).format(Date())
+        return ScanResult(Snapshot(time, processes, zram, swaps.toString().ifBlank { "不可用" }), "", System.currentTimeMillis() - started)
+    }
+}
+}{3:-0}; name=${'{4:-unknown}
+              case "\${'$'}uid" in ''|*[!0-9]*) uid=0;; esac
+              case "\${'$'}rss" in ''|*[!0-9]*) rss=0;; esac
+              case "\${'$'}vswap" in ''|*[!0-9]*) vswap=0;; esac
+              if [ "\${'$'}INCLUDE_SYSTEM" = "0" ] && [ "\${'$'}uid" -lt 10000 ] 2>/dev/null; then
+                done_count=\${'$'}((done_count+1))
+                echo "PROGRESS|\${'$'}done_count|\${'$'}total|过滤系统进程|PID \${'$'}pid"
+                continue
+              fi
+              statline=\${'$'}(cat "\${'$'}x/stat" 2>/dev/null)
+              startticks=\${'$'}(printf '%s\\n' "\${'$'}statline" | awk '{sub(/^.*\\) /,""); print \${'$'}20}')
+              [ -n "\${'$'}startticks" ] || startticks=0
+              pss=-1
+              swap=\${'$'}vswap
+              if [ "\${'$'}DETAIL" = "1" ] && [ -r "\${'$'}x/smaps" ]; then
+                mem=\${'$'}(awk '/^Pss:/{p+=\${'$'}2} /^Swap:/{s+=\${'$'}2} END{printf "%d|%d",p,s}' "\${'$'}x/smaps" 2>/dev/null)
+                oldifs=\${'$'}IFS; IFS='|'; set -- \${'$'}mem; IFS=\${'$'}oldifs
+                pss=\${'$'}{1:--1}; swap=\${'$'}{2:-\${'$'}vswap}
+              fi
+              name=\${'$'}(printf '%s' "\${'$'}name" | tr '|\\t\\r\\n' '____')
+              echo "PROC|\${'$'}pid|\${'$'}uid|\${'$'}startticks|\${'$'}name|\${'$'}rss|\${'$'}pss|\${'$'}swap"
+              done_count=\${'$'}((done_count+1))
+              if [ "\${'$'}DETAIL" = "1" ]; then stage="详细 PSS"; else stage="基础扫描"; fi
+              echo "PROGRESS|\${'$'}done_count|\${'$'}total|\${'$'}stage|PID \${'$'}pid"
+            done
+            echo "SCAN_END"
+        """.trimIndent()
+
+        val process = try {
+            ProcessBuilder("su", "-c", script).redirectErrorStream(true).start()
+        } catch (e: Exception) {
+            return ScanResult(null, e.toString(), System.currentTimeMillis() - started)
+        }
+        val lines = java.util.Collections.synchronizedList(mutableListOf<String>())
+        var total = 0
+        val reader = thread(name = "pmm-stream-reader") {
+            try {
+                process.inputStream.bufferedReader().useLines { seq ->
+                    seq.forEach { line ->
+                        if (lines.size < 100000) lines.add(line)
+                        when {
+                            line.startsWith("TOTAL|") -> total = line.substringAfter('|').toIntOrNull() ?: 0
+                            line.startsWith("PROGRESS|") -> {
+                                val fields = line.split('|', limit = 5)
+                                if (fields.size >= 4) {
+                                    onProgress(fields[1].toIntOrNull() ?: 0, total, fields[3], fields.getOrElse(4) { "" })
+                                }
+                            }
+                        }
+                    }
+                }
+            } catch (_: Exception) {}
+        }
+        val finished = process.waitFor(if (detailed) 300 else 120, TimeUnit.SECONDS)
+        if (!finished) {
+            process.destroy()
+            if (process.isAlive) process.destroyForcibly()
+            reader.join(2000)
+            return ScanResult(null, "扫描超过时间限制（详细模式 300 秒 / 快速模式 120 秒）", System.currentTimeMillis() - started)
+        }
+        reader.join(2000)
+        val output = lines.toList()
+        if (process.exitValue() != 0 || "SCAN_END" !in output) {
+            return ScanResult(null, output.takeLast(35).joinToString("\n"), System.currentTimeMillis() - started)
+        }
+        var zram = "不可用"
+        val swaps = StringBuilder()
+        var inSwaps = false
+        val processes = mutableListOf<ProcessItem>()
+        output.forEach { line ->
+            when {
+                line.startsWith("ZRAM|") -> zram = line.substringAfter('|').ifBlank { "不可用" }
+                line == "SWAPS_BEGIN" -> inSwaps = true
+                line == "SWAPS_END" -> inSwaps = false
+                inSwaps -> if (line.isNotBlank()) swaps.append(line).append("; ")
+                line.startsWith("PROC|") -> {
+                    val f = line.split('|', limit = 8)
+                    if (f.size == 8) processes.add(ProcessItem(
+                        f[1].toIntOrNull() ?: 0, f[2].toIntOrNull() ?: 0, f[3], f[4],
+                        f[5].toLongOrNull() ?: 0, f[6].toLongOrNull() ?: -1, f[7].toLongOrNull() ?: 0
+                    ))
+                }
+            }
+        }
+        val time = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US).format(Date())
+        return ScanResult(Snapshot(time, processes, zram, swaps.toString().ifBlank { "不可用" }), "", System.currentTimeMillis() - started)
+    }
+}
+}{4:-unknown}
+              case "${'uid" in ''|*[!0-9]*) uid=0;; esac
+              case "\${'$'}rss" in ''|*[!0-9]*) rss=0;; esac
+              case "\${'$'}vswap" in ''|*[!0-9]*) vswap=0;; esac
+              if [ "\${'$'}INCLUDE_SYSTEM" = "0" ] && [ "\${'$'}uid" -lt 10000 ] 2>/dev/null; then
+                done_count=\${'$'}((done_count+1))
+                echo "PROGRESS|\${'$'}done_count|\${'$'}total|过滤系统进程|PID \${'$'}pid"
+                continue
+              fi
+              statline=\${'$'}(cat "\${'$'}x/stat" 2>/dev/null)
+              startticks=\${'$'}(printf '%s\\n' "\${'$'}statline" | awk '{sub(/^.*\\) /,""); print \${'$'}20}')
+              [ -n "\${'$'}startticks" ] || startticks=0
+              pss=-1
+              swap=\${'$'}vswap
+              if [ "\${'$'}DETAIL" = "1" ] && [ -r "\${'$'}x/smaps" ]; then
+                mem=\${'$'}(awk '/^Pss:/{p+=\${'$'}2} /^Swap:/{s+=\${'$'}2} END{printf "%d|%d",p,s}' "\${'$'}x/smaps" 2>/dev/null)
+                oldifs=\${'$'}IFS; IFS='|'; set -- \${'$'}mem; IFS=\${'$'}oldifs
+                pss=\${'$'}{1:--1}; swap=\${'$'}{2:-\${'$'}vswap}
+              fi
+              name=\${'$'}(printf '%s' "\${'$'}name" | tr '|\\t\\r\\n' '____')
+              echo "PROC|\${'$'}pid|\${'$'}uid|\${'$'}startticks|\${'$'}name|\${'$'}rss|\${'$'}pss|\${'$'}swap"
+              done_count=\${'$'}((done_count+1))
+              if [ "\${'$'}DETAIL" = "1" ]; then stage="详细 PSS"; else stage="基础扫描"; fi
+              echo "PROGRESS|\${'$'}done_count|\${'$'}total|\${'$'}stage|PID \${'$'}pid"
+            done
+            echo "SCAN_END"
+        """.trimIndent()
+
+        val process = try {
+            ProcessBuilder("su", "-c", script).redirectErrorStream(true).start()
+        } catch (e: Exception) {
+            return ScanResult(null, e.toString(), System.currentTimeMillis() - started)
+        }
+        val lines = java.util.Collections.synchronizedList(mutableListOf<String>())
+        var total = 0
+        val reader = thread(name = "pmm-stream-reader") {
+            try {
+                process.inputStream.bufferedReader().useLines { seq ->
+                    seq.forEach { line ->
+                        if (lines.size < 100000) lines.add(line)
+                        when {
+                            line.startsWith("TOTAL|") -> total = line.substringAfter('|').toIntOrNull() ?: 0
+                            line.startsWith("PROGRESS|") -> {
+                                val fields = line.split('|', limit = 5)
+                                if (fields.size >= 4) {
+                                    onProgress(fields[1].toIntOrNull() ?: 0, total, fields[3], fields.getOrElse(4) { "" })
+                                }
+                            }
+                        }
+                    }
+                }
+            } catch (_: Exception) {}
+        }
+        val finished = process.waitFor(if (detailed) 300 else 120, TimeUnit.SECONDS)
+        if (!finished) {
+            process.destroy()
+            if (process.isAlive) process.destroyForcibly()
+            reader.join(2000)
+            return ScanResult(null, "扫描超过时间限制（详细模式 300 秒 / 快速模式 120 秒）", System.currentTimeMillis() - started)
+        }
+        reader.join(2000)
+        val output = lines.toList()
+        if (process.exitValue() != 0 || "SCAN_END" !in output) {
+            return ScanResult(null, output.takeLast(35).joinToString("\n"), System.currentTimeMillis() - started)
+        }
+        var zram = "不可用"
+        val swaps = StringBuilder()
+        var inSwaps = false
+        val processes = mutableListOf<ProcessItem>()
+        output.forEach { line ->
+            when {
+                line.startsWith("ZRAM|") -> zram = line.substringAfter('|').ifBlank { "不可用" }
+                line == "SWAPS_BEGIN" -> inSwaps = true
+                line == "SWAPS_END" -> inSwaps = false
+                inSwaps -> if (line.isNotBlank()) swaps.append(line).append("; ")
+                line.startsWith("PROC|") -> {
+                    val f = line.split('|', limit = 8)
+                    if (f.size == 8) processes.add(ProcessItem(
+                        f[1].toIntOrNull() ?: 0, f[2].toIntOrNull() ?: 0, f[3], f[4],
+                        f[5].toLongOrNull() ?: 0, f[6].toLongOrNull() ?: -1, f[7].toLongOrNull() ?: 0
+                    ))
+                }
+            }
+        }
+        val time = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US).format(Date())
+        return ScanResult(Snapshot(time, processes, zram, swaps.toString().ifBlank { "不可用" }), "", System.currentTimeMillis() - started)
+    }
+}
+}uid" in ''|*[!0-9]*) uid=0;; esac
+              case "${'rss" in ''|*[!0-9]*) rss=0;; esac
+              case "\${'$'}vswap" in ''|*[!0-9]*) vswap=0;; esac
+              if [ "\${'$'}INCLUDE_SYSTEM" = "0" ] && [ "\${'$'}uid" -lt 10000 ] 2>/dev/null; then
+                done_count=\${'$'}((done_count+1))
+                echo "PROGRESS|\${'$'}done_count|\${'$'}total|过滤系统进程|PID \${'$'}pid"
+                continue
+              fi
+              statline=\${'$'}(cat "\${'$'}x/stat" 2>/dev/null)
+              startticks=\${'$'}(printf '%s\\n' "\${'$'}statline" | awk '{sub(/^.*\\) /,""); print \${'$'}20}')
+              [ -n "\${'$'}startticks" ] || startticks=0
+              pss=-1
+              swap=\${'$'}vswap
+              if [ "\${'$'}DETAIL" = "1" ] && [ -r "\${'$'}x/smaps" ]; then
+                mem=\${'$'}(awk '/^Pss:/{p+=\${'$'}2} /^Swap:/{s+=\${'$'}2} END{printf "%d|%d",p,s}' "\${'$'}x/smaps" 2>/dev/null)
+                oldifs=\${'$'}IFS; IFS='|'; set -- \${'$'}mem; IFS=\${'$'}oldifs
+                pss=\${'$'}{1:--1}; swap=\${'$'}{2:-\${'$'}vswap}
+              fi
+              name=\${'$'}(printf '%s' "\${'$'}name" | tr '|\\t\\r\\n' '____')
+              echo "PROC|\${'$'}pid|\${'$'}uid|\${'$'}startticks|\${'$'}name|\${'$'}rss|\${'$'}pss|\${'$'}swap"
+              done_count=\${'$'}((done_count+1))
+              if [ "\${'$'}DETAIL" = "1" ]; then stage="详细 PSS"; else stage="基础扫描"; fi
+              echo "PROGRESS|\${'$'}done_count|\${'$'}total|\${'$'}stage|PID \${'$'}pid"
+            done
+            echo "SCAN_END"
+        """.trimIndent()
+
+        val process = try {
+            ProcessBuilder("su", "-c", script).redirectErrorStream(true).start()
+        } catch (e: Exception) {
+            return ScanResult(null, e.toString(), System.currentTimeMillis() - started)
+        }
+        val lines = java.util.Collections.synchronizedList(mutableListOf<String>())
+        var total = 0
+        val reader = thread(name = "pmm-stream-reader") {
+            try {
+                process.inputStream.bufferedReader().useLines { seq ->
+                    seq.forEach { line ->
+                        if (lines.size < 100000) lines.add(line)
+                        when {
+                            line.startsWith("TOTAL|") -> total = line.substringAfter('|').toIntOrNull() ?: 0
+                            line.startsWith("PROGRESS|") -> {
+                                val fields = line.split('|', limit = 5)
+                                if (fields.size >= 4) {
+                                    onProgress(fields[1].toIntOrNull() ?: 0, total, fields[3], fields.getOrElse(4) { "" })
+                                }
+                            }
+                        }
+                    }
+                }
+            } catch (_: Exception) {}
+        }
+        val finished = process.waitFor(if (detailed) 300 else 120, TimeUnit.SECONDS)
+        if (!finished) {
+            process.destroy()
+            if (process.isAlive) process.destroyForcibly()
+            reader.join(2000)
+            return ScanResult(null, "扫描超过时间限制（详细模式 300 秒 / 快速模式 120 秒）", System.currentTimeMillis() - started)
+        }
+        reader.join(2000)
+        val output = lines.toList()
+        if (process.exitValue() != 0 || "SCAN_END" !in output) {
+            return ScanResult(null, output.takeLast(35).joinToString("\n"), System.currentTimeMillis() - started)
+        }
+        var zram = "不可用"
+        val swaps = StringBuilder()
+        var inSwaps = false
+        val processes = mutableListOf<ProcessItem>()
+        output.forEach { line ->
+            when {
+                line.startsWith("ZRAM|") -> zram = line.substringAfter('|').ifBlank { "不可用" }
+                line == "SWAPS_BEGIN" -> inSwaps = true
+                line == "SWAPS_END" -> inSwaps = false
+                inSwaps -> if (line.isNotBlank()) swaps.append(line).append("; ")
+                line.startsWith("PROC|") -> {
+                    val f = line.split('|', limit = 8)
+                    if (f.size == 8) processes.add(ProcessItem(
+                        f[1].toIntOrNull() ?: 0, f[2].toIntOrNull() ?: 0, f[3], f[4],
+                        f[5].toLongOrNull() ?: 0, f[6].toLongOrNull() ?: -1, f[7].toLongOrNull() ?: 0
+                    ))
+                }
+            }
+        }
+        val time = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US).format(Date())
+        return ScanResult(Snapshot(time, processes, zram, swaps.toString().ifBlank { "不可用" }), "", System.currentTimeMillis() - started)
+    }
+}
+}rss" in ''|*[!0-9]*) rss=0;; esac
+              case "${'vswap" in ''|*[!0-9]*) vswap=0;; esac
+              if [ "\${'$'}INCLUDE_SYSTEM" = "0" ] && [ "\${'$'}uid" -lt 10000 ] 2>/dev/null; then
+                done_count=\${'$'}((done_count+1))
+                echo "PROGRESS|\${'$'}done_count|\${'$'}total|过滤系统进程|PID \${'$'}pid"
+                continue
+              fi
+              statline=\${'$'}(cat "\${'$'}x/stat" 2>/dev/null)
+              startticks=\${'$'}(printf '%s\\n' "\${'$'}statline" | awk '{sub(/^.*\\) /,""); print \${'$'}20}')
+              [ -n "\${'$'}startticks" ] || startticks=0
+              pss=-1
+              swap=\${'$'}vswap
+              if [ "\${'$'}DETAIL" = "1" ] && [ -r "\${'$'}x/smaps" ]; then
+                mem=\${'$'}(awk '/^Pss:/{p+=\${'$'}2} /^Swap:/{s+=\${'$'}2} END{printf "%d|%d",p,s}' "\${'$'}x/smaps" 2>/dev/null)
+                oldifs=\${'$'}IFS; IFS='|'; set -- \${'$'}mem; IFS=\${'$'}oldifs
+                pss=\${'$'}{1:--1}; swap=\${'$'}{2:-\${'$'}vswap}
+              fi
+              name=\${'$'}(printf '%s' "\${'$'}name" | tr '|\\t\\r\\n' '____')
+              echo "PROC|\${'$'}pid|\${'$'}uid|\${'$'}startticks|\${'$'}name|\${'$'}rss|\${'$'}pss|\${'$'}swap"
+              done_count=\${'$'}((done_count+1))
+              if [ "\${'$'}DETAIL" = "1" ]; then stage="详细 PSS"; else stage="基础扫描"; fi
+              echo "PROGRESS|\${'$'}done_count|\${'$'}total|\${'$'}stage|PID \${'$'}pid"
+            done
+            echo "SCAN_END"
+        """.trimIndent()
+
+        val process = try {
+            ProcessBuilder("su", "-c", script).redirectErrorStream(true).start()
+        } catch (e: Exception) {
+            return ScanResult(null, e.toString(), System.currentTimeMillis() - started)
+        }
+        val lines = java.util.Collections.synchronizedList(mutableListOf<String>())
+        var total = 0
+        val reader = thread(name = "pmm-stream-reader") {
+            try {
+                process.inputStream.bufferedReader().useLines { seq ->
+                    seq.forEach { line ->
+                        if (lines.size < 100000) lines.add(line)
+                        when {
+                            line.startsWith("TOTAL|") -> total = line.substringAfter('|').toIntOrNull() ?: 0
+                            line.startsWith("PROGRESS|") -> {
+                                val fields = line.split('|', limit = 5)
+                                if (fields.size >= 4) {
+                                    onProgress(fields[1].toIntOrNull() ?: 0, total, fields[3], fields.getOrElse(4) { "" })
+                                }
+                            }
+                        }
+                    }
+                }
+            } catch (_: Exception) {}
+        }
+        val finished = process.waitFor(if (detailed) 300 else 120, TimeUnit.SECONDS)
+        if (!finished) {
+            process.destroy()
+            if (process.isAlive) process.destroyForcibly()
+            reader.join(2000)
+            return ScanResult(null, "扫描超过时间限制（详细模式 300 秒 / 快速模式 120 秒）", System.currentTimeMillis() - started)
+        }
+        reader.join(2000)
+        val output = lines.toList()
+        if (process.exitValue() != 0 || "SCAN_END" !in output) {
+            return ScanResult(null, output.takeLast(35).joinToString("\n"), System.currentTimeMillis() - started)
+        }
+        var zram = "不可用"
+        val swaps = StringBuilder()
+        var inSwaps = false
+        val processes = mutableListOf<ProcessItem>()
+        output.forEach { line ->
+            when {
+                line.startsWith("ZRAM|") -> zram = line.substringAfter('|').ifBlank { "不可用" }
+                line == "SWAPS_BEGIN" -> inSwaps = true
+                line == "SWAPS_END" -> inSwaps = false
+                inSwaps -> if (line.isNotBlank()) swaps.append(line).append("; ")
+                line.startsWith("PROC|") -> {
+                    val f = line.split('|', limit = 8)
+                    if (f.size == 8) processes.add(ProcessItem(
+                        f[1].toIntOrNull() ?: 0, f[2].toIntOrNull() ?: 0, f[3], f[4],
+                        f[5].toLongOrNull() ?: 0, f[6].toLongOrNull() ?: -1, f[7].toLongOrNull() ?: 0
+                    ))
+                }
+            }
+        }
+        val time = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US).format(Date())
+        return ScanResult(Snapshot(time, processes, zram, swaps.toString().ifBlank { "不可用" }), "", System.currentTimeMillis() - started)
+    }
+}
+}vswap" in ''|*[!0-9]*) vswap=0;; esac
+              if [ "${'INCLUDE_SYSTEM" = "0" ] && [ "\${'$'}uid" -lt 10000 ] 2>/dev/null; then
+                done_count=\${'$'}((done_count+1))
+                echo "PROGRESS|\${'$'}done_count|\${'$'}total|过滤系统进程|PID \${'$'}pid"
+                continue
+              fi
+              statline=\${'$'}(cat "\${'$'}x/stat" 2>/dev/null)
+              startticks=\${'$'}(printf '%s\\n' "\${'$'}statline" | awk '{sub(/^.*\\) /,""); print \${'$'}20}')
+              [ -n "\${'$'}startticks" ] || startticks=0
+              pss=-1
+              swap=\${'$'}vswap
+              if [ "\${'$'}DETAIL" = "1" ] && [ -r "\${'$'}x/smaps" ]; then
+                mem=\${'$'}(awk '/^Pss:/{p+=\${'$'}2} /^Swap:/{s+=\${'$'}2} END{printf "%d|%d",p,s}' "\${'$'}x/smaps" 2>/dev/null)
+                oldifs=\${'$'}IFS; IFS='|'; set -- \${'$'}mem; IFS=\${'$'}oldifs
+                pss=\${'$'}{1:--1}; swap=\${'$'}{2:-\${'$'}vswap}
+              fi
+              name=\${'$'}(printf '%s' "\${'$'}name" | tr '|\\t\\r\\n' '____')
+              echo "PROC|\${'$'}pid|\${'$'}uid|\${'$'}startticks|\${'$'}name|\${'$'}rss|\${'$'}pss|\${'$'}swap"
+              done_count=\${'$'}((done_count+1))
+              if [ "\${'$'}DETAIL" = "1" ]; then stage="详细 PSS"; else stage="基础扫描"; fi
+              echo "PROGRESS|\${'$'}done_count|\${'$'}total|\${'$'}stage|PID \${'$'}pid"
+            done
+            echo "SCAN_END"
+        """.trimIndent()
+
+        val process = try {
+            ProcessBuilder("su", "-c", script).redirectErrorStream(true).start()
+        } catch (e: Exception) {
+            return ScanResult(null, e.toString(), System.currentTimeMillis() - started)
+        }
+        val lines = java.util.Collections.synchronizedList(mutableListOf<String>())
+        var total = 0
+        val reader = thread(name = "pmm-stream-reader") {
+            try {
+                process.inputStream.bufferedReader().useLines { seq ->
+                    seq.forEach { line ->
+                        if (lines.size < 100000) lines.add(line)
+                        when {
+                            line.startsWith("TOTAL|") -> total = line.substringAfter('|').toIntOrNull() ?: 0
+                            line.startsWith("PROGRESS|") -> {
+                                val fields = line.split('|', limit = 5)
+                                if (fields.size >= 4) {
+                                    onProgress(fields[1].toIntOrNull() ?: 0, total, fields[3], fields.getOrElse(4) { "" })
+                                }
+                            }
+                        }
+                    }
+                }
+            } catch (_: Exception) {}
+        }
+        val finished = process.waitFor(if (detailed) 300 else 120, TimeUnit.SECONDS)
+        if (!finished) {
+            process.destroy()
+            if (process.isAlive) process.destroyForcibly()
+            reader.join(2000)
+            return ScanResult(null, "扫描超过时间限制（详细模式 300 秒 / 快速模式 120 秒）", System.currentTimeMillis() - started)
+        }
+        reader.join(2000)
+        val output = lines.toList()
+        if (process.exitValue() != 0 || "SCAN_END" !in output) {
+            return ScanResult(null, output.takeLast(35).joinToString("\n"), System.currentTimeMillis() - started)
+        }
+        var zram = "不可用"
+        val swaps = StringBuilder()
+        var inSwaps = false
+        val processes = mutableListOf<ProcessItem>()
+        output.forEach { line ->
+            when {
+                line.startsWith("ZRAM|") -> zram = line.substringAfter('|').ifBlank { "不可用" }
+                line == "SWAPS_BEGIN" -> inSwaps = true
+                line == "SWAPS_END" -> inSwaps = false
+                inSwaps -> if (line.isNotBlank()) swaps.append(line).append("; ")
+                line.startsWith("PROC|") -> {
+                    val f = line.split('|', limit = 8)
+                    if (f.size == 8) processes.add(ProcessItem(
+                        f[1].toIntOrNull() ?: 0, f[2].toIntOrNull() ?: 0, f[3], f[4],
+                        f[5].toLongOrNull() ?: 0, f[6].toLongOrNull() ?: -1, f[7].toLongOrNull() ?: 0
+                    ))
+                }
+            }
+        }
+        val time = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US).format(Date())
+        return ScanResult(Snapshot(time, processes, zram, swaps.toString().ifBlank { "不可用" }), "", System.currentTimeMillis() - started)
+    }
+}
+}INCLUDE_SYSTEM" = "0" ] && [ "${'uid" -lt 10000 ] 2>/dev/null; then
+                done_count=\${'$'}((done_count+1))
+                echo "PROGRESS|\${'$'}done_count|\${'$'}total|过滤系统进程|PID \${'$'}pid"
+                continue
+              fi
+              statline=\${'$'}(cat "\${'$'}x/stat" 2>/dev/null)
+              startticks=\${'$'}(printf '%s\\n' "\${'$'}statline" | awk '{sub(/^.*\\) /,""); print \${'$'}20}')
+              [ -n "\${'$'}startticks" ] || startticks=0
+              pss=-1
+              swap=\${'$'}vswap
+              if [ "\${'$'}DETAIL" = "1" ] && [ -r "\${'$'}x/smaps" ]; then
+                mem=\${'$'}(awk '/^Pss:/{p+=\${'$'}2} /^Swap:/{s+=\${'$'}2} END{printf "%d|%d",p,s}' "\${'$'}x/smaps" 2>/dev/null)
+                oldifs=\${'$'}IFS; IFS='|'; set -- \${'$'}mem; IFS=\${'$'}oldifs
+                pss=\${'$'}{1:--1}; swap=\${'$'}{2:-\${'$'}vswap}
+              fi
+              name=\${'$'}(printf '%s' "\${'$'}name" | tr '|\\t\\r\\n' '____')
+              echo "PROC|\${'$'}pid|\${'$'}uid|\${'$'}startticks|\${'$'}name|\${'$'}rss|\${'$'}pss|\${'$'}swap"
+              done_count=\${'$'}((done_count+1))
+              if [ "\${'$'}DETAIL" = "1" ]; then stage="详细 PSS"; else stage="基础扫描"; fi
+              echo "PROGRESS|\${'$'}done_count|\${'$'}total|\${'$'}stage|PID \${'$'}pid"
+            done
+            echo "SCAN_END"
+        """.trimIndent()
+
+        val process = try {
+            ProcessBuilder("su", "-c", script).redirectErrorStream(true).start()
+        } catch (e: Exception) {
+            return ScanResult(null, e.toString(), System.currentTimeMillis() - started)
+        }
+        val lines = java.util.Collections.synchronizedList(mutableListOf<String>())
+        var total = 0
+        val reader = thread(name = "pmm-stream-reader") {
+            try {
+                process.inputStream.bufferedReader().useLines { seq ->
+                    seq.forEach { line ->
+                        if (lines.size < 100000) lines.add(line)
+                        when {
+                            line.startsWith("TOTAL|") -> total = line.substringAfter('|').toIntOrNull() ?: 0
+                            line.startsWith("PROGRESS|") -> {
+                                val fields = line.split('|', limit = 5)
+                                if (fields.size >= 4) {
+                                    onProgress(fields[1].toIntOrNull() ?: 0, total, fields[3], fields.getOrElse(4) { "" })
+                                }
+                            }
+                        }
+                    }
+                }
+            } catch (_: Exception) {}
+        }
+        val finished = process.waitFor(if (detailed) 300 else 120, TimeUnit.SECONDS)
+        if (!finished) {
+            process.destroy()
+            if (process.isAlive) process.destroyForcibly()
+            reader.join(2000)
+            return ScanResult(null, "扫描超过时间限制（详细模式 300 秒 / 快速模式 120 秒）", System.currentTimeMillis() - started)
+        }
+        reader.join(2000)
+        val output = lines.toList()
+        if (process.exitValue() != 0 || "SCAN_END" !in output) {
+            return ScanResult(null, output.takeLast(35).joinToString("\n"), System.currentTimeMillis() - started)
+        }
+        var zram = "不可用"
+        val swaps = StringBuilder()
+        var inSwaps = false
+        val processes = mutableListOf<ProcessItem>()
+        output.forEach { line ->
+            when {
+                line.startsWith("ZRAM|") -> zram = line.substringAfter('|').ifBlank { "不可用" }
+                line == "SWAPS_BEGIN" -> inSwaps = true
+                line == "SWAPS_END" -> inSwaps = false
+                inSwaps -> if (line.isNotBlank()) swaps.append(line).append("; ")
+                line.startsWith("PROC|") -> {
+                    val f = line.split('|', limit = 8)
+                    if (f.size == 8) processes.add(ProcessItem(
+                        f[1].toIntOrNull() ?: 0, f[2].toIntOrNull() ?: 0, f[3], f[4],
+                        f[5].toLongOrNull() ?: 0, f[6].toLongOrNull() ?: -1, f[7].toLongOrNull() ?: 0
+                    ))
+                }
+            }
+        }
+        val time = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US).format(Date())
+        return ScanResult(Snapshot(time, processes, zram, swaps.toString().ifBlank { "不可用" }), "", System.currentTimeMillis() - started)
+    }
+}
+}uid" -lt 10000 ] 2>/dev/null; then
+                done_count=${'((done_count+1))
+                echo "PROGRESS|\${'$'}done_count|\${'$'}total|过滤系统进程|PID \${'$'}pid"
+                continue
+              fi
+              statline=\${'$'}(cat "\${'$'}x/stat" 2>/dev/null)
+              startticks=\${'$'}(printf '%s\\n' "\${'$'}statline" | awk '{sub(/^.*\\) /,""); print \${'$'}20}')
+              [ -n "\${'$'}startticks" ] || startticks=0
+              pss=-1
+              swap=\${'$'}vswap
+              if [ "\${'$'}DETAIL" = "1" ] && [ -r "\${'$'}x/smaps" ]; then
+                mem=\${'$'}(awk '/^Pss:/{p+=\${'$'}2} /^Swap:/{s+=\${'$'}2} END{printf "%d|%d",p,s}' "\${'$'}x/smaps" 2>/dev/null)
+                oldifs=\${'$'}IFS; IFS='|'; set -- \${'$'}mem; IFS=\${'$'}oldifs
+                pss=\${'$'}{1:--1}; swap=\${'$'}{2:-\${'$'}vswap}
+              fi
+              name=\${'$'}(printf '%s' "\${'$'}name" | tr '|\\t\\r\\n' '____')
+              echo "PROC|\${'$'}pid|\${'$'}uid|\${'$'}startticks|\${'$'}name|\${'$'}rss|\${'$'}pss|\${'$'}swap"
+              done_count=\${'$'}((done_count+1))
+              if [ "\${'$'}DETAIL" = "1" ]; then stage="详细 PSS"; else stage="基础扫描"; fi
+              echo "PROGRESS|\${'$'}done_count|\${'$'}total|\${'$'}stage|PID \${'$'}pid"
+            done
+            echo "SCAN_END"
+        """.trimIndent()
+
+        val process = try {
+            ProcessBuilder("su", "-c", script).redirectErrorStream(true).start()
+        } catch (e: Exception) {
+            return ScanResult(null, e.toString(), System.currentTimeMillis() - started)
+        }
+        val lines = java.util.Collections.synchronizedList(mutableListOf<String>())
+        var total = 0
+        val reader = thread(name = "pmm-stream-reader") {
+            try {
+                process.inputStream.bufferedReader().useLines { seq ->
+                    seq.forEach { line ->
+                        if (lines.size < 100000) lines.add(line)
+                        when {
+                            line.startsWith("TOTAL|") -> total = line.substringAfter('|').toIntOrNull() ?: 0
+                            line.startsWith("PROGRESS|") -> {
+                                val fields = line.split('|', limit = 5)
+                                if (fields.size >= 4) {
+                                    onProgress(fields[1].toIntOrNull() ?: 0, total, fields[3], fields.getOrElse(4) { "" })
+                                }
+                            }
+                        }
+                    }
+                }
+            } catch (_: Exception) {}
+        }
+        val finished = process.waitFor(if (detailed) 300 else 120, TimeUnit.SECONDS)
+        if (!finished) {
+            process.destroy()
+            if (process.isAlive) process.destroyForcibly()
+            reader.join(2000)
+            return ScanResult(null, "扫描超过时间限制（详细模式 300 秒 / 快速模式 120 秒）", System.currentTimeMillis() - started)
+        }
+        reader.join(2000)
+        val output = lines.toList()
+        if (process.exitValue() != 0 || "SCAN_END" !in output) {
+            return ScanResult(null, output.takeLast(35).joinToString("\n"), System.currentTimeMillis() - started)
+        }
+        var zram = "不可用"
+        val swaps = StringBuilder()
+        var inSwaps = false
+        val processes = mutableListOf<ProcessItem>()
+        output.forEach { line ->
+            when {
+                line.startsWith("ZRAM|") -> zram = line.substringAfter('|').ifBlank { "不可用" }
+                line == "SWAPS_BEGIN" -> inSwaps = true
+                line == "SWAPS_END" -> inSwaps = false
+                inSwaps -> if (line.isNotBlank()) swaps.append(line).append("; ")
+                line.startsWith("PROC|") -> {
+                    val f = line.split('|', limit = 8)
+                    if (f.size == 8) processes.add(ProcessItem(
+                        f[1].toIntOrNull() ?: 0, f[2].toIntOrNull() ?: 0, f[3], f[4],
+                        f[5].toLongOrNull() ?: 0, f[6].toLongOrNull() ?: -1, f[7].toLongOrNull() ?: 0
+                    ))
+                }
+            }
+        }
+        val time = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US).format(Date())
+        return ScanResult(Snapshot(time, processes, zram, swaps.toString().ifBlank { "不可用" }), "", System.currentTimeMillis() - started)
+    }
+}
+}((done_count+1))
+                echo "PROGRESS|${'done_count|\${'$'}total|过滤系统进程|PID \${'$'}pid"
+                continue
+              fi
+              statline=\${'$'}(cat "\${'$'}x/stat" 2>/dev/null)
+              startticks=\${'$'}(printf '%s\\n' "\${'$'}statline" | awk '{sub(/^.*\\) /,""); print \${'$'}20}')
+              [ -n "\${'$'}startticks" ] || startticks=0
+              pss=-1
+              swap=\${'$'}vswap
+              if [ "\${'$'}DETAIL" = "1" ] && [ -r "\${'$'}x/smaps" ]; then
+                mem=\${'$'}(awk '/^Pss:/{p+=\${'$'}2} /^Swap:/{s+=\${'$'}2} END{printf "%d|%d",p,s}' "\${'$'}x/smaps" 2>/dev/null)
+                oldifs=\${'$'}IFS; IFS='|'; set -- \${'$'}mem; IFS=\${'$'}oldifs
+                pss=\${'$'}{1:--1}; swap=\${'$'}{2:-\${'$'}vswap}
+              fi
+              name=\${'$'}(printf '%s' "\${'$'}name" | tr '|\\t\\r\\n' '____')
+              echo "PROC|\${'$'}pid|\${'$'}uid|\${'$'}startticks|\${'$'}name|\${'$'}rss|\${'$'}pss|\${'$'}swap"
+              done_count=\${'$'}((done_count+1))
+              if [ "\${'$'}DETAIL" = "1" ]; then stage="详细 PSS"; else stage="基础扫描"; fi
+              echo "PROGRESS|\${'$'}done_count|\${'$'}total|\${'$'}stage|PID \${'$'}pid"
+            done
+            echo "SCAN_END"
+        """.trimIndent()
+
+        val process = try {
+            ProcessBuilder("su", "-c", script).redirectErrorStream(true).start()
+        } catch (e: Exception) {
+            return ScanResult(null, e.toString(), System.currentTimeMillis() - started)
+        }
+        val lines = java.util.Collections.synchronizedList(mutableListOf<String>())
+        var total = 0
+        val reader = thread(name = "pmm-stream-reader") {
+            try {
+                process.inputStream.bufferedReader().useLines { seq ->
+                    seq.forEach { line ->
+                        if (lines.size < 100000) lines.add(line)
+                        when {
+                            line.startsWith("TOTAL|") -> total = line.substringAfter('|').toIntOrNull() ?: 0
+                            line.startsWith("PROGRESS|") -> {
+                                val fields = line.split('|', limit = 5)
+                                if (fields.size >= 4) {
+                                    onProgress(fields[1].toIntOrNull() ?: 0, total, fields[3], fields.getOrElse(4) { "" })
+                                }
+                            }
+                        }
+                    }
+                }
+            } catch (_: Exception) {}
+        }
+        val finished = process.waitFor(if (detailed) 300 else 120, TimeUnit.SECONDS)
+        if (!finished) {
+            process.destroy()
+            if (process.isAlive) process.destroyForcibly()
+            reader.join(2000)
+            return ScanResult(null, "扫描超过时间限制（详细模式 300 秒 / 快速模式 120 秒）", System.currentTimeMillis() - started)
+        }
+        reader.join(2000)
+        val output = lines.toList()
+        if (process.exitValue() != 0 || "SCAN_END" !in output) {
+            return ScanResult(null, output.takeLast(35).joinToString("\n"), System.currentTimeMillis() - started)
+        }
+        var zram = "不可用"
+        val swaps = StringBuilder()
+        var inSwaps = false
+        val processes = mutableListOf<ProcessItem>()
+        output.forEach { line ->
+            when {
+                line.startsWith("ZRAM|") -> zram = line.substringAfter('|').ifBlank { "不可用" }
+                line == "SWAPS_BEGIN" -> inSwaps = true
+                line == "SWAPS_END" -> inSwaps = false
+                inSwaps -> if (line.isNotBlank()) swaps.append(line).append("; ")
+                line.startsWith("PROC|") -> {
+                    val f = line.split('|', limit = 8)
+                    if (f.size == 8) processes.add(ProcessItem(
+                        f[1].toIntOrNull() ?: 0, f[2].toIntOrNull() ?: 0, f[3], f[4],
+                        f[5].toLongOrNull() ?: 0, f[6].toLongOrNull() ?: -1, f[7].toLongOrNull() ?: 0
+                    ))
+                }
+            }
+        }
+        val time = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US).format(Date())
+        return ScanResult(Snapshot(time, processes, zram, swaps.toString().ifBlank { "不可用" }), "", System.currentTimeMillis() - started)
+    }
+}
+}done_count|${'total|过滤系统进程|PID \${'$'}pid"
+                continue
+              fi
+              statline=\${'$'}(cat "\${'$'}x/stat" 2>/dev/null)
+              startticks=\${'$'}(printf '%s\\n' "\${'$'}statline" | awk '{sub(/^.*\\) /,""); print \${'$'}20}')
+              [ -n "\${'$'}startticks" ] || startticks=0
+              pss=-1
+              swap=\${'$'}vswap
+              if [ "\${'$'}DETAIL" = "1" ] && [ -r "\${'$'}x/smaps" ]; then
+                mem=\${'$'}(awk '/^Pss:/{p+=\${'$'}2} /^Swap:/{s+=\${'$'}2} END{printf "%d|%d",p,s}' "\${'$'}x/smaps" 2>/dev/null)
+                oldifs=\${'$'}IFS; IFS='|'; set -- \${'$'}mem; IFS=\${'$'}oldifs
+                pss=\${'$'}{1:--1}; swap=\${'$'}{2:-\${'$'}vswap}
+              fi
+              name=\${'$'}(printf '%s' "\${'$'}name" | tr '|\\t\\r\\n' '____')
+              echo "PROC|\${'$'}pid|\${'$'}uid|\${'$'}startticks|\${'$'}name|\${'$'}rss|\${'$'}pss|\${'$'}swap"
+              done_count=\${'$'}((done_count+1))
+              if [ "\${'$'}DETAIL" = "1" ]; then stage="详细 PSS"; else stage="基础扫描"; fi
+              echo "PROGRESS|\${'$'}done_count|\${'$'}total|\${'$'}stage|PID \${'$'}pid"
+            done
+            echo "SCAN_END"
+        """.trimIndent()
+
+        val process = try {
+            ProcessBuilder("su", "-c", script).redirectErrorStream(true).start()
+        } catch (e: Exception) {
+            return ScanResult(null, e.toString(), System.currentTimeMillis() - started)
+        }
+        val lines = java.util.Collections.synchronizedList(mutableListOf<String>())
+        var total = 0
+        val reader = thread(name = "pmm-stream-reader") {
+            try {
+                process.inputStream.bufferedReader().useLines { seq ->
+                    seq.forEach { line ->
+                        if (lines.size < 100000) lines.add(line)
+                        when {
+                            line.startsWith("TOTAL|") -> total = line.substringAfter('|').toIntOrNull() ?: 0
+                            line.startsWith("PROGRESS|") -> {
+                                val fields = line.split('|', limit = 5)
+                                if (fields.size >= 4) {
+                                    onProgress(fields[1].toIntOrNull() ?: 0, total, fields[3], fields.getOrElse(4) { "" })
+                                }
+                            }
+                        }
+                    }
+                }
+            } catch (_: Exception) {}
+        }
+        val finished = process.waitFor(if (detailed) 300 else 120, TimeUnit.SECONDS)
+        if (!finished) {
+            process.destroy()
+            if (process.isAlive) process.destroyForcibly()
+            reader.join(2000)
+            return ScanResult(null, "扫描超过时间限制（详细模式 300 秒 / 快速模式 120 秒）", System.currentTimeMillis() - started)
+        }
+        reader.join(2000)
+        val output = lines.toList()
+        if (process.exitValue() != 0 || "SCAN_END" !in output) {
+            return ScanResult(null, output.takeLast(35).joinToString("\n"), System.currentTimeMillis() - started)
+        }
+        var zram = "不可用"
+        val swaps = StringBuilder()
+        var inSwaps = false
+        val processes = mutableListOf<ProcessItem>()
+        output.forEach { line ->
+            when {
+                line.startsWith("ZRAM|") -> zram = line.substringAfter('|').ifBlank { "不可用" }
+                line == "SWAPS_BEGIN" -> inSwaps = true
+                line == "SWAPS_END" -> inSwaps = false
+                inSwaps -> if (line.isNotBlank()) swaps.append(line).append("; ")
+                line.startsWith("PROC|") -> {
+                    val f = line.split('|', limit = 8)
+                    if (f.size == 8) processes.add(ProcessItem(
+                        f[1].toIntOrNull() ?: 0, f[2].toIntOrNull() ?: 0, f[3], f[4],
+                        f[5].toLongOrNull() ?: 0, f[6].toLongOrNull() ?: -1, f[7].toLongOrNull() ?: 0
+                    ))
+                }
+            }
+        }
+        val time = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US).format(Date())
+        return ScanResult(Snapshot(time, processes, zram, swaps.toString().ifBlank { "不可用" }), "", System.currentTimeMillis() - started)
+    }
+}
+}total|过滤系统进程|PID ${'pid"
+                continue
+              fi
+              statline=\${'$'}(cat "\${'$'}x/stat" 2>/dev/null)
+              startticks=\${'$'}(printf '%s\\n' "\${'$'}statline" | awk '{sub(/^.*\\) /,""); print \${'$'}20}')
+              [ -n "\${'$'}startticks" ] || startticks=0
+              pss=-1
+              swap=\${'$'}vswap
+              if [ "\${'$'}DETAIL" = "1" ] && [ -r "\${'$'}x/smaps" ]; then
+                mem=\${'$'}(awk '/^Pss:/{p+=\${'$'}2} /^Swap:/{s+=\${'$'}2} END{printf "%d|%d",p,s}' "\${'$'}x/smaps" 2>/dev/null)
+                oldifs=\${'$'}IFS; IFS='|'; set -- \${'$'}mem; IFS=\${'$'}oldifs
+                pss=\${'$'}{1:--1}; swap=\${'$'}{2:-\${'$'}vswap}
+              fi
+              name=\${'$'}(printf '%s' "\${'$'}name" | tr '|\\t\\r\\n' '____')
+              echo "PROC|\${'$'}pid|\${'$'}uid|\${'$'}startticks|\${'$'}name|\${'$'}rss|\${'$'}pss|\${'$'}swap"
+              done_count=\${'$'}((done_count+1))
+              if [ "\${'$'}DETAIL" = "1" ]; then stage="详细 PSS"; else stage="基础扫描"; fi
+              echo "PROGRESS|\${'$'}done_count|\${'$'}total|\${'$'}stage|PID \${'$'}pid"
+            done
+            echo "SCAN_END"
+        """.trimIndent()
+
+        val process = try {
+            ProcessBuilder("su", "-c", script).redirectErrorStream(true).start()
+        } catch (e: Exception) {
+            return ScanResult(null, e.toString(), System.currentTimeMillis() - started)
+        }
+        val lines = java.util.Collections.synchronizedList(mutableListOf<String>())
+        var total = 0
+        val reader = thread(name = "pmm-stream-reader") {
+            try {
+                process.inputStream.bufferedReader().useLines { seq ->
+                    seq.forEach { line ->
+                        if (lines.size < 100000) lines.add(line)
+                        when {
+                            line.startsWith("TOTAL|") -> total = line.substringAfter('|').toIntOrNull() ?: 0
+                            line.startsWith("PROGRESS|") -> {
+                                val fields = line.split('|', limit = 5)
+                                if (fields.size >= 4) {
+                                    onProgress(fields[1].toIntOrNull() ?: 0, total, fields[3], fields.getOrElse(4) { "" })
+                                }
+                            }
+                        }
+                    }
+                }
+            } catch (_: Exception) {}
+        }
+        val finished = process.waitFor(if (detailed) 300 else 120, TimeUnit.SECONDS)
+        if (!finished) {
+            process.destroy()
+            if (process.isAlive) process.destroyForcibly()
+            reader.join(2000)
+            return ScanResult(null, "扫描超过时间限制（详细模式 300 秒 / 快速模式 120 秒）", System.currentTimeMillis() - started)
+        }
+        reader.join(2000)
+        val output = lines.toList()
+        if (process.exitValue() != 0 || "SCAN_END" !in output) {
+            return ScanResult(null, output.takeLast(35).joinToString("\n"), System.currentTimeMillis() - started)
+        }
+        var zram = "不可用"
+        val swaps = StringBuilder()
+        var inSwaps = false
+        val processes = mutableListOf<ProcessItem>()
+        output.forEach { line ->
+            when {
+                line.startsWith("ZRAM|") -> zram = line.substringAfter('|').ifBlank { "不可用" }
+                line == "SWAPS_BEGIN" -> inSwaps = true
+                line == "SWAPS_END" -> inSwaps = false
+                inSwaps -> if (line.isNotBlank()) swaps.append(line).append("; ")
+                line.startsWith("PROC|") -> {
+                    val f = line.split('|', limit = 8)
+                    if (f.size == 8) processes.add(ProcessItem(
+                        f[1].toIntOrNull() ?: 0, f[2].toIntOrNull() ?: 0, f[3], f[4],
+                        f[5].toLongOrNull() ?: 0, f[6].toLongOrNull() ?: -1, f[7].toLongOrNull() ?: 0
+                    ))
+                }
+            }
+        }
+        val time = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US).format(Date())
+        return ScanResult(Snapshot(time, processes, zram, swaps.toString().ifBlank { "不可用" }), "", System.currentTimeMillis() - started)
+    }
+}
+}pid"
+                continue
+              fi
+              statline=${'(cat "\${'$'}x/stat" 2>/dev/null)
+              startticks=\${'$'}(printf '%s\\n' "\${'$'}statline" | awk '{sub(/^.*\\) /,""); print \${'$'}20}')
+              [ -n "\${'$'}startticks" ] || startticks=0
+              pss=-1
+              swap=\${'$'}vswap
+              if [ "\${'$'}DETAIL" = "1" ] && [ -r "\${'$'}x/smaps" ]; then
+                mem=\${'$'}(awk '/^Pss:/{p+=\${'$'}2} /^Swap:/{s+=\${'$'}2} END{printf "%d|%d",p,s}' "\${'$'}x/smaps" 2>/dev/null)
+                oldifs=\${'$'}IFS; IFS='|'; set -- \${'$'}mem; IFS=\${'$'}oldifs
+                pss=\${'$'}{1:--1}; swap=\${'$'}{2:-\${'$'}vswap}
+              fi
+              name=\${'$'}(printf '%s' "\${'$'}name" | tr '|\\t\\r\\n' '____')
+              echo "PROC|\${'$'}pid|\${'$'}uid|\${'$'}startticks|\${'$'}name|\${'$'}rss|\${'$'}pss|\${'$'}swap"
+              done_count=\${'$'}((done_count+1))
+              if [ "\${'$'}DETAIL" = "1" ]; then stage="详细 PSS"; else stage="基础扫描"; fi
+              echo "PROGRESS|\${'$'}done_count|\${'$'}total|\${'$'}stage|PID \${'$'}pid"
+            done
+            echo "SCAN_END"
+        """.trimIndent()
+
+        val process = try {
+            ProcessBuilder("su", "-c", script).redirectErrorStream(true).start()
+        } catch (e: Exception) {
+            return ScanResult(null, e.toString(), System.currentTimeMillis() - started)
+        }
+        val lines = java.util.Collections.synchronizedList(mutableListOf<String>())
+        var total = 0
+        val reader = thread(name = "pmm-stream-reader") {
+            try {
+                process.inputStream.bufferedReader().useLines { seq ->
+                    seq.forEach { line ->
+                        if (lines.size < 100000) lines.add(line)
+                        when {
+                            line.startsWith("TOTAL|") -> total = line.substringAfter('|').toIntOrNull() ?: 0
+                            line.startsWith("PROGRESS|") -> {
+                                val fields = line.split('|', limit = 5)
+                                if (fields.size >= 4) {
+                                    onProgress(fields[1].toIntOrNull() ?: 0, total, fields[3], fields.getOrElse(4) { "" })
+                                }
+                            }
+                        }
+                    }
+                }
+            } catch (_: Exception) {}
+        }
+        val finished = process.waitFor(if (detailed) 300 else 120, TimeUnit.SECONDS)
+        if (!finished) {
+            process.destroy()
+            if (process.isAlive) process.destroyForcibly()
+            reader.join(2000)
+            return ScanResult(null, "扫描超过时间限制（详细模式 300 秒 / 快速模式 120 秒）", System.currentTimeMillis() - started)
+        }
+        reader.join(2000)
+        val output = lines.toList()
+        if (process.exitValue() != 0 || "SCAN_END" !in output) {
+            return ScanResult(null, output.takeLast(35).joinToString("\n"), System.currentTimeMillis() - started)
+        }
+        var zram = "不可用"
+        val swaps = StringBuilder()
+        var inSwaps = false
+        val processes = mutableListOf<ProcessItem>()
+        output.forEach { line ->
+            when {
+                line.startsWith("ZRAM|") -> zram = line.substringAfter('|').ifBlank { "不可用" }
+                line == "SWAPS_BEGIN" -> inSwaps = true
+                line == "SWAPS_END" -> inSwaps = false
+                inSwaps -> if (line.isNotBlank()) swaps.append(line).append("; ")
+                line.startsWith("PROC|") -> {
+                    val f = line.split('|', limit = 8)
+                    if (f.size == 8) processes.add(ProcessItem(
+                        f[1].toIntOrNull() ?: 0, f[2].toIntOrNull() ?: 0, f[3], f[4],
+                        f[5].toLongOrNull() ?: 0, f[6].toLongOrNull() ?: -1, f[7].toLongOrNull() ?: 0
+                    ))
+                }
+            }
+        }
+        val time = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US).format(Date())
+        return ScanResult(Snapshot(time, processes, zram, swaps.toString().ifBlank { "不可用" }), "", System.currentTimeMillis() - started)
+    }
+}
+}(cat "${'x/stat" 2>/dev/null)
+              startticks=\${'$'}(printf '%s\\n' "\${'$'}statline" | awk '{sub(/^.*\\) /,""); print \${'$'}20}')
+              [ -n "\${'$'}startticks" ] || startticks=0
+              pss=-1
+              swap=\${'$'}vswap
+              if [ "\${'$'}DETAIL" = "1" ] && [ -r "\${'$'}x/smaps" ]; then
+                mem=\${'$'}(awk '/^Pss:/{p+=\${'$'}2} /^Swap:/{s+=\${'$'}2} END{printf "%d|%d",p,s}' "\${'$'}x/smaps" 2>/dev/null)
+                oldifs=\${'$'}IFS; IFS='|'; set -- \${'$'}mem; IFS=\${'$'}oldifs
+                pss=\${'$'}{1:--1}; swap=\${'$'}{2:-\${'$'}vswap}
+              fi
+              name=\${'$'}(printf '%s' "\${'$'}name" | tr '|\\t\\r\\n' '____')
+              echo "PROC|\${'$'}pid|\${'$'}uid|\${'$'}startticks|\${'$'}name|\${'$'}rss|\${'$'}pss|\${'$'}swap"
+              done_count=\${'$'}((done_count+1))
+              if [ "\${'$'}DETAIL" = "1" ]; then stage="详细 PSS"; else stage="基础扫描"; fi
+              echo "PROGRESS|\${'$'}done_count|\${'$'}total|\${'$'}stage|PID \${'$'}pid"
+            done
+            echo "SCAN_END"
+        """.trimIndent()
+
+        val process = try {
+            ProcessBuilder("su", "-c", script).redirectErrorStream(true).start()
+        } catch (e: Exception) {
+            return ScanResult(null, e.toString(), System.currentTimeMillis() - started)
+        }
+        val lines = java.util.Collections.synchronizedList(mutableListOf<String>())
+        var total = 0
+        val reader = thread(name = "pmm-stream-reader") {
+            try {
+                process.inputStream.bufferedReader().useLines { seq ->
+                    seq.forEach { line ->
+                        if (lines.size < 100000) lines.add(line)
+                        when {
+                            line.startsWith("TOTAL|") -> total = line.substringAfter('|').toIntOrNull() ?: 0
+                            line.startsWith("PROGRESS|") -> {
+                                val fields = line.split('|', limit = 5)
+                                if (fields.size >= 4) {
+                                    onProgress(fields[1].toIntOrNull() ?: 0, total, fields[3], fields.getOrElse(4) { "" })
+                                }
+                            }
+                        }
+                    }
+                }
+            } catch (_: Exception) {}
+        }
+        val finished = process.waitFor(if (detailed) 300 else 120, TimeUnit.SECONDS)
+        if (!finished) {
+            process.destroy()
+            if (process.isAlive) process.destroyForcibly()
+            reader.join(2000)
+            return ScanResult(null, "扫描超过时间限制（详细模式 300 秒 / 快速模式 120 秒）", System.currentTimeMillis() - started)
+        }
+        reader.join(2000)
+        val output = lines.toList()
+        if (process.exitValue() != 0 || "SCAN_END" !in output) {
+            return ScanResult(null, output.takeLast(35).joinToString("\n"), System.currentTimeMillis() - started)
+        }
+        var zram = "不可用"
+        val swaps = StringBuilder()
+        var inSwaps = false
+        val processes = mutableListOf<ProcessItem>()
+        output.forEach { line ->
+            when {
+                line.startsWith("ZRAM|") -> zram = line.substringAfter('|').ifBlank { "不可用" }
+                line == "SWAPS_BEGIN" -> inSwaps = true
+                line == "SWAPS_END" -> inSwaps = false
+                inSwaps -> if (line.isNotBlank()) swaps.append(line).append("; ")
+                line.startsWith("PROC|") -> {
+                    val f = line.split('|', limit = 8)
+                    if (f.size == 8) processes.add(ProcessItem(
+                        f[1].toIntOrNull() ?: 0, f[2].toIntOrNull() ?: 0, f[3], f[4],
+                        f[5].toLongOrNull() ?: 0, f[6].toLongOrNull() ?: -1, f[7].toLongOrNull() ?: 0
+                    ))
+                }
+            }
+        }
+        val time = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US).format(Date())
+        return ScanResult(Snapshot(time, processes, zram, swaps.toString().ifBlank { "不可用" }), "", System.currentTimeMillis() - started)
+    }
+}
+}x/stat" 2>/dev/null)
+              startticks=${'(printf '%s\\n' "\${'$'}statline" | awk '{sub(/^.*\\) /,""); print \${'$'}20}')
+              [ -n "\${'$'}startticks" ] || startticks=0
+              pss=-1
+              swap=\${'$'}vswap
+              if [ "\${'$'}DETAIL" = "1" ] && [ -r "\${'$'}x/smaps" ]; then
+                mem=\${'$'}(awk '/^Pss:/{p+=\${'$'}2} /^Swap:/{s+=\${'$'}2} END{printf "%d|%d",p,s}' "\${'$'}x/smaps" 2>/dev/null)
+                oldifs=\${'$'}IFS; IFS='|'; set -- \${'$'}mem; IFS=\${'$'}oldifs
+                pss=\${'$'}{1:--1}; swap=\${'$'}{2:-\${'$'}vswap}
+              fi
+              name=\${'$'}(printf '%s' "\${'$'}name" | tr '|\\t\\r\\n' '____')
+              echo "PROC|\${'$'}pid|\${'$'}uid|\${'$'}startticks|\${'$'}name|\${'$'}rss|\${'$'}pss|\${'$'}swap"
+              done_count=\${'$'}((done_count+1))
+              if [ "\${'$'}DETAIL" = "1" ]; then stage="详细 PSS"; else stage="基础扫描"; fi
+              echo "PROGRESS|\${'$'}done_count|\${'$'}total|\${'$'}stage|PID \${'$'}pid"
+            done
+            echo "SCAN_END"
+        """.trimIndent()
+
+        val process = try {
+            ProcessBuilder("su", "-c", script).redirectErrorStream(true).start()
+        } catch (e: Exception) {
+            return ScanResult(null, e.toString(), System.currentTimeMillis() - started)
+        }
+        val lines = java.util.Collections.synchronizedList(mutableListOf<String>())
+        var total = 0
+        val reader = thread(name = "pmm-stream-reader") {
+            try {
+                process.inputStream.bufferedReader().useLines { seq ->
+                    seq.forEach { line ->
+                        if (lines.size < 100000) lines.add(line)
+                        when {
+                            line.startsWith("TOTAL|") -> total = line.substringAfter('|').toIntOrNull() ?: 0
+                            line.startsWith("PROGRESS|") -> {
+                                val fields = line.split('|', limit = 5)
+                                if (fields.size >= 4) {
+                                    onProgress(fields[1].toIntOrNull() ?: 0, total, fields[3], fields.getOrElse(4) { "" })
+                                }
+                            }
+                        }
+                    }
+                }
+            } catch (_: Exception) {}
+        }
+        val finished = process.waitFor(if (detailed) 300 else 120, TimeUnit.SECONDS)
+        if (!finished) {
+            process.destroy()
+            if (process.isAlive) process.destroyForcibly()
+            reader.join(2000)
+            return ScanResult(null, "扫描超过时间限制（详细模式 300 秒 / 快速模式 120 秒）", System.currentTimeMillis() - started)
+        }
+        reader.join(2000)
+        val output = lines.toList()
+        if (process.exitValue() != 0 || "SCAN_END" !in output) {
+            return ScanResult(null, output.takeLast(35).joinToString("\n"), System.currentTimeMillis() - started)
+        }
+        var zram = "不可用"
+        val swaps = StringBuilder()
+        var inSwaps = false
+        val processes = mutableListOf<ProcessItem>()
+        output.forEach { line ->
+            when {
+                line.startsWith("ZRAM|") -> zram = line.substringAfter('|').ifBlank { "不可用" }
+                line == "SWAPS_BEGIN" -> inSwaps = true
+                line == "SWAPS_END" -> inSwaps = false
+                inSwaps -> if (line.isNotBlank()) swaps.append(line).append("; ")
+                line.startsWith("PROC|") -> {
+                    val f = line.split('|', limit = 8)
+                    if (f.size == 8) processes.add(ProcessItem(
+                        f[1].toIntOrNull() ?: 0, f[2].toIntOrNull() ?: 0, f[3], f[4],
+                        f[5].toLongOrNull() ?: 0, f[6].toLongOrNull() ?: -1, f[7].toLongOrNull() ?: 0
+                    ))
+                }
+            }
+        }
+        val time = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US).format(Date())
+        return ScanResult(Snapshot(time, processes, zram, swaps.toString().ifBlank { "不可用" }), "", System.currentTimeMillis() - started)
+    }
+}
+}(printf '%s\\n' "${'statline" | awk '{sub(/^.*\\) /,""); print \${'$'}20}')
+              [ -n "\${'$'}startticks" ] || startticks=0
+              pss=-1
+              swap=\${'$'}vswap
+              if [ "\${'$'}DETAIL" = "1" ] && [ -r "\${'$'}x/smaps" ]; then
+                mem=\${'$'}(awk '/^Pss:/{p+=\${'$'}2} /^Swap:/{s+=\${'$'}2} END{printf "%d|%d",p,s}' "\${'$'}x/smaps" 2>/dev/null)
+                oldifs=\${'$'}IFS; IFS='|'; set -- \${'$'}mem; IFS=\${'$'}oldifs
+                pss=\${'$'}{1:--1}; swap=\${'$'}{2:-\${'$'}vswap}
+              fi
+              name=\${'$'}(printf '%s' "\${'$'}name" | tr '|\\t\\r\\n' '____')
+              echo "PROC|\${'$'}pid|\${'$'}uid|\${'$'}startticks|\${'$'}name|\${'$'}rss|\${'$'}pss|\${'$'}swap"
+              done_count=\${'$'}((done_count+1))
+              if [ "\${'$'}DETAIL" = "1" ]; then stage="详细 PSS"; else stage="基础扫描"; fi
+              echo "PROGRESS|\${'$'}done_count|\${'$'}total|\${'$'}stage|PID \${'$'}pid"
+            done
+            echo "SCAN_END"
+        """.trimIndent()
+
+        val process = try {
+            ProcessBuilder("su", "-c", script).redirectErrorStream(true).start()
+        } catch (e: Exception) {
+            return ScanResult(null, e.toString(), System.currentTimeMillis() - started)
+        }
+        val lines = java.util.Collections.synchronizedList(mutableListOf<String>())
+        var total = 0
+        val reader = thread(name = "pmm-stream-reader") {
+            try {
+                process.inputStream.bufferedReader().useLines { seq ->
+                    seq.forEach { line ->
+                        if (lines.size < 100000) lines.add(line)
+                        when {
+                            line.startsWith("TOTAL|") -> total = line.substringAfter('|').toIntOrNull() ?: 0
+                            line.startsWith("PROGRESS|") -> {
+                                val fields = line.split('|', limit = 5)
+                                if (fields.size >= 4) {
+                                    onProgress(fields[1].toIntOrNull() ?: 0, total, fields[3], fields.getOrElse(4) { "" })
+                                }
+                            }
+                        }
+                    }
+                }
+            } catch (_: Exception) {}
+        }
+        val finished = process.waitFor(if (detailed) 300 else 120, TimeUnit.SECONDS)
+        if (!finished) {
+            process.destroy()
+            if (process.isAlive) process.destroyForcibly()
+            reader.join(2000)
+            return ScanResult(null, "扫描超过时间限制（详细模式 300 秒 / 快速模式 120 秒）", System.currentTimeMillis() - started)
+        }
+        reader.join(2000)
+        val output = lines.toList()
+        if (process.exitValue() != 0 || "SCAN_END" !in output) {
+            return ScanResult(null, output.takeLast(35).joinToString("\n"), System.currentTimeMillis() - started)
+        }
+        var zram = "不可用"
+        val swaps = StringBuilder()
+        var inSwaps = false
+        val processes = mutableListOf<ProcessItem>()
+        output.forEach { line ->
+            when {
+                line.startsWith("ZRAM|") -> zram = line.substringAfter('|').ifBlank { "不可用" }
+                line == "SWAPS_BEGIN" -> inSwaps = true
+                line == "SWAPS_END" -> inSwaps = false
+                inSwaps -> if (line.isNotBlank()) swaps.append(line).append("; ")
+                line.startsWith("PROC|") -> {
+                    val f = line.split('|', limit = 8)
+                    if (f.size == 8) processes.add(ProcessItem(
+                        f[1].toIntOrNull() ?: 0, f[2].toIntOrNull() ?: 0, f[3], f[4],
+                        f[5].toLongOrNull() ?: 0, f[6].toLongOrNull() ?: -1, f[7].toLongOrNull() ?: 0
+                    ))
+                }
+            }
+        }
+        val time = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US).format(Date())
+        return ScanResult(Snapshot(time, processes, zram, swaps.toString().ifBlank { "不可用" }), "", System.currentTimeMillis() - started)
+    }
+}
+}statline" | awk '{sub(/^.*\\) /,""); print ${'20}')
+              [ -n "\${'$'}startticks" ] || startticks=0
+              pss=-1
+              swap=\${'$'}vswap
+              if [ "\${'$'}DETAIL" = "1" ] && [ -r "\${'$'}x/smaps" ]; then
+                mem=\${'$'}(awk '/^Pss:/{p+=\${'$'}2} /^Swap:/{s+=\${'$'}2} END{printf "%d|%d",p,s}' "\${'$'}x/smaps" 2>/dev/null)
+                oldifs=\${'$'}IFS; IFS='|'; set -- \${'$'}mem; IFS=\${'$'}oldifs
+                pss=\${'$'}{1:--1}; swap=\${'$'}{2:-\${'$'}vswap}
+              fi
+              name=\${'$'}(printf '%s' "\${'$'}name" | tr '|\\t\\r\\n' '____')
+              echo "PROC|\${'$'}pid|\${'$'}uid|\${'$'}startticks|\${'$'}name|\${'$'}rss|\${'$'}pss|\${'$'}swap"
+              done_count=\${'$'}((done_count+1))
+              if [ "\${'$'}DETAIL" = "1" ]; then stage="详细 PSS"; else stage="基础扫描"; fi
+              echo "PROGRESS|\${'$'}done_count|\${'$'}total|\${'$'}stage|PID \${'$'}pid"
+            done
+            echo "SCAN_END"
+        """.trimIndent()
+
+        val process = try {
+            ProcessBuilder("su", "-c", script).redirectErrorStream(true).start()
+        } catch (e: Exception) {
+            return ScanResult(null, e.toString(), System.currentTimeMillis() - started)
+        }
+        val lines = java.util.Collections.synchronizedList(mutableListOf<String>())
+        var total = 0
+        val reader = thread(name = "pmm-stream-reader") {
+            try {
+                process.inputStream.bufferedReader().useLines { seq ->
+                    seq.forEach { line ->
+                        if (lines.size < 100000) lines.add(line)
+                        when {
+                            line.startsWith("TOTAL|") -> total = line.substringAfter('|').toIntOrNull() ?: 0
+                            line.startsWith("PROGRESS|") -> {
+                                val fields = line.split('|', limit = 5)
+                                if (fields.size >= 4) {
+                                    onProgress(fields[1].toIntOrNull() ?: 0, total, fields[3], fields.getOrElse(4) { "" })
+                                }
+                            }
+                        }
+                    }
+                }
+            } catch (_: Exception) {}
+        }
+        val finished = process.waitFor(if (detailed) 300 else 120, TimeUnit.SECONDS)
+        if (!finished) {
+            process.destroy()
+            if (process.isAlive) process.destroyForcibly()
+            reader.join(2000)
+            return ScanResult(null, "扫描超过时间限制（详细模式 300 秒 / 快速模式 120 秒）", System.currentTimeMillis() - started)
+        }
+        reader.join(2000)
+        val output = lines.toList()
+        if (process.exitValue() != 0 || "SCAN_END" !in output) {
+            return ScanResult(null, output.takeLast(35).joinToString("\n"), System.currentTimeMillis() - started)
+        }
+        var zram = "不可用"
+        val swaps = StringBuilder()
+        var inSwaps = false
+        val processes = mutableListOf<ProcessItem>()
+        output.forEach { line ->
+            when {
+                line.startsWith("ZRAM|") -> zram = line.substringAfter('|').ifBlank { "不可用" }
+                line == "SWAPS_BEGIN" -> inSwaps = true
+                line == "SWAPS_END" -> inSwaps = false
+                inSwaps -> if (line.isNotBlank()) swaps.append(line).append("; ")
+                line.startsWith("PROC|") -> {
+                    val f = line.split('|', limit = 8)
+                    if (f.size == 8) processes.add(ProcessItem(
+                        f[1].toIntOrNull() ?: 0, f[2].toIntOrNull() ?: 0, f[3], f[4],
+                        f[5].toLongOrNull() ?: 0, f[6].toLongOrNull() ?: -1, f[7].toLongOrNull() ?: 0
+                    ))
+                }
+            }
+        }
+        val time = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US).format(Date())
+        return ScanResult(Snapshot(time, processes, zram, swaps.toString().ifBlank { "不可用" }), "", System.currentTimeMillis() - started)
+    }
+}
+}20}')
+              [ -n "${'startticks" ] || startticks=0
+              pss=-1
+              swap=\${'$'}vswap
+              if [ "\${'$'}DETAIL" = "1" ] && [ -r "\${'$'}x/smaps" ]; then
+                mem=\${'$'}(awk '/^Pss:/{p+=\${'$'}2} /^Swap:/{s+=\${'$'}2} END{printf "%d|%d",p,s}' "\${'$'}x/smaps" 2>/dev/null)
+                oldifs=\${'$'}IFS; IFS='|'; set -- \${'$'}mem; IFS=\${'$'}oldifs
+                pss=\${'$'}{1:--1}; swap=\${'$'}{2:-\${'$'}vswap}
+              fi
+              name=\${'$'}(printf '%s' "\${'$'}name" | tr '|\\t\\r\\n' '____')
+              echo "PROC|\${'$'}pid|\${'$'}uid|\${'$'}startticks|\${'$'}name|\${'$'}rss|\${'$'}pss|\${'$'}swap"
+              done_count=\${'$'}((done_count+1))
+              if [ "\${'$'}DETAIL" = "1" ]; then stage="详细 PSS"; else stage="基础扫描"; fi
+              echo "PROGRESS|\${'$'}done_count|\${'$'}total|\${'$'}stage|PID \${'$'}pid"
+            done
+            echo "SCAN_END"
+        """.trimIndent()
+
+        val process = try {
+            ProcessBuilder("su", "-c", script).redirectErrorStream(true).start()
+        } catch (e: Exception) {
+            return ScanResult(null, e.toString(), System.currentTimeMillis() - started)
+        }
+        val lines = java.util.Collections.synchronizedList(mutableListOf<String>())
+        var total = 0
+        val reader = thread(name = "pmm-stream-reader") {
+            try {
+                process.inputStream.bufferedReader().useLines { seq ->
+                    seq.forEach { line ->
+                        if (lines.size < 100000) lines.add(line)
+                        when {
+                            line.startsWith("TOTAL|") -> total = line.substringAfter('|').toIntOrNull() ?: 0
+                            line.startsWith("PROGRESS|") -> {
+                                val fields = line.split('|', limit = 5)
+                                if (fields.size >= 4) {
+                                    onProgress(fields[1].toIntOrNull() ?: 0, total, fields[3], fields.getOrElse(4) { "" })
+                                }
+                            }
+                        }
+                    }
+                }
+            } catch (_: Exception) {}
+        }
+        val finished = process.waitFor(if (detailed) 300 else 120, TimeUnit.SECONDS)
+        if (!finished) {
+            process.destroy()
+            if (process.isAlive) process.destroyForcibly()
+            reader.join(2000)
+            return ScanResult(null, "扫描超过时间限制（详细模式 300 秒 / 快速模式 120 秒）", System.currentTimeMillis() - started)
+        }
+        reader.join(2000)
+        val output = lines.toList()
+        if (process.exitValue() != 0 || "SCAN_END" !in output) {
+            return ScanResult(null, output.takeLast(35).joinToString("\n"), System.currentTimeMillis() - started)
+        }
+        var zram = "不可用"
+        val swaps = StringBuilder()
+        var inSwaps = false
+        val processes = mutableListOf<ProcessItem>()
+        output.forEach { line ->
+            when {
+                line.startsWith("ZRAM|") -> zram = line.substringAfter('|').ifBlank { "不可用" }
+                line == "SWAPS_BEGIN" -> inSwaps = true
+                line == "SWAPS_END" -> inSwaps = false
+                inSwaps -> if (line.isNotBlank()) swaps.append(line).append("; ")
+                line.startsWith("PROC|") -> {
+                    val f = line.split('|', limit = 8)
+                    if (f.size == 8) processes.add(ProcessItem(
+                        f[1].toIntOrNull() ?: 0, f[2].toIntOrNull() ?: 0, f[3], f[4],
+                        f[5].toLongOrNull() ?: 0, f[6].toLongOrNull() ?: -1, f[7].toLongOrNull() ?: 0
+                    ))
+                }
+            }
+        }
+        val time = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US).format(Date())
+        return ScanResult(Snapshot(time, processes, zram, swaps.toString().ifBlank { "不可用" }), "", System.currentTimeMillis() - started)
+    }
+}
+}startticks" ] || startticks=0
+              pss=-1
+              swap=${'vswap
+              if [ "\${'$'}DETAIL" = "1" ] && [ -r "\${'$'}x/smaps" ]; then
+                mem=\${'$'}(awk '/^Pss:/{p+=\${'$'}2} /^Swap:/{s+=\${'$'}2} END{printf "%d|%d",p,s}' "\${'$'}x/smaps" 2>/dev/null)
+                oldifs=\${'$'}IFS; IFS='|'; set -- \${'$'}mem; IFS=\${'$'}oldifs
+                pss=\${'$'}{1:--1}; swap=\${'$'}{2:-\${'$'}vswap}
+              fi
+              name=\${'$'}(printf '%s' "\${'$'}name" | tr '|\\t\\r\\n' '____')
+              echo "PROC|\${'$'}pid|\${'$'}uid|\${'$'}startticks|\${'$'}name|\${'$'}rss|\${'$'}pss|\${'$'}swap"
+              done_count=\${'$'}((done_count+1))
+              if [ "\${'$'}DETAIL" = "1" ]; then stage="详细 PSS"; else stage="基础扫描"; fi
+              echo "PROGRESS|\${'$'}done_count|\${'$'}total|\${'$'}stage|PID \${'$'}pid"
+            done
+            echo "SCAN_END"
+        """.trimIndent()
+
+        val process = try {
+            ProcessBuilder("su", "-c", script).redirectErrorStream(true).start()
+        } catch (e: Exception) {
+            return ScanResult(null, e.toString(), System.currentTimeMillis() - started)
+        }
+        val lines = java.util.Collections.synchronizedList(mutableListOf<String>())
+        var total = 0
+        val reader = thread(name = "pmm-stream-reader") {
+            try {
+                process.inputStream.bufferedReader().useLines { seq ->
+                    seq.forEach { line ->
+                        if (lines.size < 100000) lines.add(line)
+                        when {
+                            line.startsWith("TOTAL|") -> total = line.substringAfter('|').toIntOrNull() ?: 0
+                            line.startsWith("PROGRESS|") -> {
+                                val fields = line.split('|', limit = 5)
+                                if (fields.size >= 4) {
+                                    onProgress(fields[1].toIntOrNull() ?: 0, total, fields[3], fields.getOrElse(4) { "" })
+                                }
+                            }
+                        }
+                    }
+                }
+            } catch (_: Exception) {}
+        }
+        val finished = process.waitFor(if (detailed) 300 else 120, TimeUnit.SECONDS)
+        if (!finished) {
+            process.destroy()
+            if (process.isAlive) process.destroyForcibly()
+            reader.join(2000)
+            return ScanResult(null, "扫描超过时间限制（详细模式 300 秒 / 快速模式 120 秒）", System.currentTimeMillis() - started)
+        }
+        reader.join(2000)
+        val output = lines.toList()
+        if (process.exitValue() != 0 || "SCAN_END" !in output) {
+            return ScanResult(null, output.takeLast(35).joinToString("\n"), System.currentTimeMillis() - started)
+        }
+        var zram = "不可用"
+        val swaps = StringBuilder()
+        var inSwaps = false
+        val processes = mutableListOf<ProcessItem>()
+        output.forEach { line ->
+            when {
+                line.startsWith("ZRAM|") -> zram = line.substringAfter('|').ifBlank { "不可用" }
+                line == "SWAPS_BEGIN" -> inSwaps = true
+                line == "SWAPS_END" -> inSwaps = false
+                inSwaps -> if (line.isNotBlank()) swaps.append(line).append("; ")
+                line.startsWith("PROC|") -> {
+                    val f = line.split('|', limit = 8)
+                    if (f.size == 8) processes.add(ProcessItem(
+                        f[1].toIntOrNull() ?: 0, f[2].toIntOrNull() ?: 0, f[3], f[4],
+                        f[5].toLongOrNull() ?: 0, f[6].toLongOrNull() ?: -1, f[7].toLongOrNull() ?: 0
+                    ))
+                }
+            }
+        }
+        val time = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US).format(Date())
+        return ScanResult(Snapshot(time, processes, zram, swaps.toString().ifBlank { "不可用" }), "", System.currentTimeMillis() - started)
+    }
+}
+}vswap
+              if [ "${'DETAIL" = "1" ] && [ -r "\${'$'}x/smaps" ]; then
+                mem=\${'$'}(awk '/^Pss:/{p+=\${'$'}2} /^Swap:/{s+=\${'$'}2} END{printf "%d|%d",p,s}' "\${'$'}x/smaps" 2>/dev/null)
+                oldifs=\${'$'}IFS; IFS='|'; set -- \${'$'}mem; IFS=\${'$'}oldifs
+                pss=\${'$'}{1:--1}; swap=\${'$'}{2:-\${'$'}vswap}
+              fi
+              name=\${'$'}(printf '%s' "\${'$'}name" | tr '|\\t\\r\\n' '____')
+              echo "PROC|\${'$'}pid|\${'$'}uid|\${'$'}startticks|\${'$'}name|\${'$'}rss|\${'$'}pss|\${'$'}swap"
+              done_count=\${'$'}((done_count+1))
+              if [ "\${'$'}DETAIL" = "1" ]; then stage="详细 PSS"; else stage="基础扫描"; fi
+              echo "PROGRESS|\${'$'}done_count|\${'$'}total|\${'$'}stage|PID \${'$'}pid"
+            done
+            echo "SCAN_END"
+        """.trimIndent()
+
+        val process = try {
+            ProcessBuilder("su", "-c", script).redirectErrorStream(true).start()
+        } catch (e: Exception) {
+            return ScanResult(null, e.toString(), System.currentTimeMillis() - started)
+        }
+        val lines = java.util.Collections.synchronizedList(mutableListOf<String>())
+        var total = 0
+        val reader = thread(name = "pmm-stream-reader") {
+            try {
+                process.inputStream.bufferedReader().useLines { seq ->
+                    seq.forEach { line ->
+                        if (lines.size < 100000) lines.add(line)
+                        when {
+                            line.startsWith("TOTAL|") -> total = line.substringAfter('|').toIntOrNull() ?: 0
+                            line.startsWith("PROGRESS|") -> {
+                                val fields = line.split('|', limit = 5)
+                                if (fields.size >= 4) {
+                                    onProgress(fields[1].toIntOrNull() ?: 0, total, fields[3], fields.getOrElse(4) { "" })
+                                }
+                            }
+                        }
+                    }
+                }
+            } catch (_: Exception) {}
+        }
+        val finished = process.waitFor(if (detailed) 300 else 120, TimeUnit.SECONDS)
+        if (!finished) {
+            process.destroy()
+            if (process.isAlive) process.destroyForcibly()
+            reader.join(2000)
+            return ScanResult(null, "扫描超过时间限制（详细模式 300 秒 / 快速模式 120 秒）", System.currentTimeMillis() - started)
+        }
+        reader.join(2000)
+        val output = lines.toList()
+        if (process.exitValue() != 0 || "SCAN_END" !in output) {
+            return ScanResult(null, output.takeLast(35).joinToString("\n"), System.currentTimeMillis() - started)
+        }
+        var zram = "不可用"
+        val swaps = StringBuilder()
+        var inSwaps = false
+        val processes = mutableListOf<ProcessItem>()
+        output.forEach { line ->
+            when {
+                line.startsWith("ZRAM|") -> zram = line.substringAfter('|').ifBlank { "不可用" }
+                line == "SWAPS_BEGIN" -> inSwaps = true
+                line == "SWAPS_END" -> inSwaps = false
+                inSwaps -> if (line.isNotBlank()) swaps.append(line).append("; ")
+                line.startsWith("PROC|") -> {
+                    val f = line.split('|', limit = 8)
+                    if (f.size == 8) processes.add(ProcessItem(
+                        f[1].toIntOrNull() ?: 0, f[2].toIntOrNull() ?: 0, f[3], f[4],
+                        f[5].toLongOrNull() ?: 0, f[6].toLongOrNull() ?: -1, f[7].toLongOrNull() ?: 0
+                    ))
+                }
+            }
+        }
+        val time = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US).format(Date())
+        return ScanResult(Snapshot(time, processes, zram, swaps.toString().ifBlank { "不可用" }), "", System.currentTimeMillis() - started)
+    }
+}
+}DETAIL" = "1" ] && [ -r "${'x/smaps" ]; then
+                mem=\${'$'}(awk '/^Pss:/{p+=\${'$'}2} /^Swap:/{s+=\${'$'}2} END{printf "%d|%d",p,s}' "\${'$'}x/smaps" 2>/dev/null)
+                oldifs=\${'$'}IFS; IFS='|'; set -- \${'$'}mem; IFS=\${'$'}oldifs
+                pss=\${'$'}{1:--1}; swap=\${'$'}{2:-\${'$'}vswap}
+              fi
+              name=\${'$'}(printf '%s' "\${'$'}name" | tr '|\\t\\r\\n' '____')
+              echo "PROC|\${'$'}pid|\${'$'}uid|\${'$'}startticks|\${'$'}name|\${'$'}rss|\${'$'}pss|\${'$'}swap"
+              done_count=\${'$'}((done_count+1))
+              if [ "\${'$'}DETAIL" = "1" ]; then stage="详细 PSS"; else stage="基础扫描"; fi
+              echo "PROGRESS|\${'$'}done_count|\${'$'}total|\${'$'}stage|PID \${'$'}pid"
+            done
+            echo "SCAN_END"
+        """.trimIndent()
+
+        val process = try {
+            ProcessBuilder("su", "-c", script).redirectErrorStream(true).start()
+        } catch (e: Exception) {
+            return ScanResult(null, e.toString(), System.currentTimeMillis() - started)
+        }
+        val lines = java.util.Collections.synchronizedList(mutableListOf<String>())
+        var total = 0
+        val reader = thread(name = "pmm-stream-reader") {
+            try {
+                process.inputStream.bufferedReader().useLines { seq ->
+                    seq.forEach { line ->
+                        if (lines.size < 100000) lines.add(line)
+                        when {
+                            line.startsWith("TOTAL|") -> total = line.substringAfter('|').toIntOrNull() ?: 0
+                            line.startsWith("PROGRESS|") -> {
+                                val fields = line.split('|', limit = 5)
+                                if (fields.size >= 4) {
+                                    onProgress(fields[1].toIntOrNull() ?: 0, total, fields[3], fields.getOrElse(4) { "" })
+                                }
+                            }
+                        }
+                    }
+                }
+            } catch (_: Exception) {}
+        }
+        val finished = process.waitFor(if (detailed) 300 else 120, TimeUnit.SECONDS)
+        if (!finished) {
+            process.destroy()
+            if (process.isAlive) process.destroyForcibly()
+            reader.join(2000)
+            return ScanResult(null, "扫描超过时间限制（详细模式 300 秒 / 快速模式 120 秒）", System.currentTimeMillis() - started)
+        }
+        reader.join(2000)
+        val output = lines.toList()
+        if (process.exitValue() != 0 || "SCAN_END" !in output) {
+            return ScanResult(null, output.takeLast(35).joinToString("\n"), System.currentTimeMillis() - started)
+        }
+        var zram = "不可用"
+        val swaps = StringBuilder()
+        var inSwaps = false
+        val processes = mutableListOf<ProcessItem>()
+        output.forEach { line ->
+            when {
+                line.startsWith("ZRAM|") -> zram = line.substringAfter('|').ifBlank { "不可用" }
+                line == "SWAPS_BEGIN" -> inSwaps = true
+                line == "SWAPS_END" -> inSwaps = false
+                inSwaps -> if (line.isNotBlank()) swaps.append(line).append("; ")
+                line.startsWith("PROC|") -> {
+                    val f = line.split('|', limit = 8)
+                    if (f.size == 8) processes.add(ProcessItem(
+                        f[1].toIntOrNull() ?: 0, f[2].toIntOrNull() ?: 0, f[3], f[4],
+                        f[5].toLongOrNull() ?: 0, f[6].toLongOrNull() ?: -1, f[7].toLongOrNull() ?: 0
+                    ))
+                }
+            }
+        }
+        val time = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US).format(Date())
+        return ScanResult(Snapshot(time, processes, zram, swaps.toString().ifBlank { "不可用" }), "", System.currentTimeMillis() - started)
+    }
+}
+}x/smaps" ]; then
+                mem=${'(awk '/^Pss:/{p+=\${'$'}2} /^Swap:/{s+=\${'$'}2} END{printf "%d|%d",p,s}' "\${'$'}x/smaps" 2>/dev/null)
+                oldifs=\${'$'}IFS; IFS='|'; set -- \${'$'}mem; IFS=\${'$'}oldifs
+                pss=\${'$'}{1:--1}; swap=\${'$'}{2:-\${'$'}vswap}
+              fi
+              name=\${'$'}(printf '%s' "\${'$'}name" | tr '|\\t\\r\\n' '____')
+              echo "PROC|\${'$'}pid|\${'$'}uid|\${'$'}startticks|\${'$'}name|\${'$'}rss|\${'$'}pss|\${'$'}swap"
+              done_count=\${'$'}((done_count+1))
+              if [ "\${'$'}DETAIL" = "1" ]; then stage="详细 PSS"; else stage="基础扫描"; fi
+              echo "PROGRESS|\${'$'}done_count|\${'$'}total|\${'$'}stage|PID \${'$'}pid"
+            done
+            echo "SCAN_END"
+        """.trimIndent()
+
+        val process = try {
+            ProcessBuilder("su", "-c", script).redirectErrorStream(true).start()
+        } catch (e: Exception) {
+            return ScanResult(null, e.toString(), System.currentTimeMillis() - started)
+        }
+        val lines = java.util.Collections.synchronizedList(mutableListOf<String>())
+        var total = 0
+        val reader = thread(name = "pmm-stream-reader") {
+            try {
+                process.inputStream.bufferedReader().useLines { seq ->
+                    seq.forEach { line ->
+                        if (lines.size < 100000) lines.add(line)
+                        when {
+                            line.startsWith("TOTAL|") -> total = line.substringAfter('|').toIntOrNull() ?: 0
+                            line.startsWith("PROGRESS|") -> {
+                                val fields = line.split('|', limit = 5)
+                                if (fields.size >= 4) {
+                                    onProgress(fields[1].toIntOrNull() ?: 0, total, fields[3], fields.getOrElse(4) { "" })
+                                }
+                            }
+                        }
+                    }
+                }
+            } catch (_: Exception) {}
+        }
+        val finished = process.waitFor(if (detailed) 300 else 120, TimeUnit.SECONDS)
+        if (!finished) {
+            process.destroy()
+            if (process.isAlive) process.destroyForcibly()
+            reader.join(2000)
+            return ScanResult(null, "扫描超过时间限制（详细模式 300 秒 / 快速模式 120 秒）", System.currentTimeMillis() - started)
+        }
+        reader.join(2000)
+        val output = lines.toList()
+        if (process.exitValue() != 0 || "SCAN_END" !in output) {
+            return ScanResult(null, output.takeLast(35).joinToString("\n"), System.currentTimeMillis() - started)
+        }
+        var zram = "不可用"
+        val swaps = StringBuilder()
+        var inSwaps = false
+        val processes = mutableListOf<ProcessItem>()
+        output.forEach { line ->
+            when {
+                line.startsWith("ZRAM|") -> zram = line.substringAfter('|').ifBlank { "不可用" }
+                line == "SWAPS_BEGIN" -> inSwaps = true
+                line == "SWAPS_END" -> inSwaps = false
+                inSwaps -> if (line.isNotBlank()) swaps.append(line).append("; ")
+                line.startsWith("PROC|") -> {
+                    val f = line.split('|', limit = 8)
+                    if (f.size == 8) processes.add(ProcessItem(
+                        f[1].toIntOrNull() ?: 0, f[2].toIntOrNull() ?: 0, f[3], f[4],
+                        f[5].toLongOrNull() ?: 0, f[6].toLongOrNull() ?: -1, f[7].toLongOrNull() ?: 0
+                    ))
+                }
+            }
+        }
+        val time = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US).format(Date())
+        return ScanResult(Snapshot(time, processes, zram, swaps.toString().ifBlank { "不可用" }), "", System.currentTimeMillis() - started)
+    }
+}
+}(awk '/^Pss:/{p+=${'2} /^Swap:/{s+=\${'$'}2} END{printf "%d|%d",p,s}' "\${'$'}x/smaps" 2>/dev/null)
+                oldifs=\${'$'}IFS; IFS='|'; set -- \${'$'}mem; IFS=\${'$'}oldifs
+                pss=\${'$'}{1:--1}; swap=\${'$'}{2:-\${'$'}vswap}
+              fi
+              name=\${'$'}(printf '%s' "\${'$'}name" | tr '|\\t\\r\\n' '____')
+              echo "PROC|\${'$'}pid|\${'$'}uid|\${'$'}startticks|\${'$'}name|\${'$'}rss|\${'$'}pss|\${'$'}swap"
+              done_count=\${'$'}((done_count+1))
+              if [ "\${'$'}DETAIL" = "1" ]; then stage="详细 PSS"; else stage="基础扫描"; fi
+              echo "PROGRESS|\${'$'}done_count|\${'$'}total|\${'$'}stage|PID \${'$'}pid"
+            done
+            echo "SCAN_END"
+        """.trimIndent()
+
+        val process = try {
+            ProcessBuilder("su", "-c", script).redirectErrorStream(true).start()
+        } catch (e: Exception) {
+            return ScanResult(null, e.toString(), System.currentTimeMillis() - started)
+        }
+        val lines = java.util.Collections.synchronizedList(mutableListOf<String>())
+        var total = 0
+        val reader = thread(name = "pmm-stream-reader") {
+            try {
+                process.inputStream.bufferedReader().useLines { seq ->
+                    seq.forEach { line ->
+                        if (lines.size < 100000) lines.add(line)
+                        when {
+                            line.startsWith("TOTAL|") -> total = line.substringAfter('|').toIntOrNull() ?: 0
+                            line.startsWith("PROGRESS|") -> {
+                                val fields = line.split('|', limit = 5)
+                                if (fields.size >= 4) {
+                                    onProgress(fields[1].toIntOrNull() ?: 0, total, fields[3], fields.getOrElse(4) { "" })
+                                }
+                            }
+                        }
+                    }
+                }
+            } catch (_: Exception) {}
+        }
+        val finished = process.waitFor(if (detailed) 300 else 120, TimeUnit.SECONDS)
+        if (!finished) {
+            process.destroy()
+            if (process.isAlive) process.destroyForcibly()
+            reader.join(2000)
+            return ScanResult(null, "扫描超过时间限制（详细模式 300 秒 / 快速模式 120 秒）", System.currentTimeMillis() - started)
+        }
+        reader.join(2000)
+        val output = lines.toList()
+        if (process.exitValue() != 0 || "SCAN_END" !in output) {
+            return ScanResult(null, output.takeLast(35).joinToString("\n"), System.currentTimeMillis() - started)
+        }
+        var zram = "不可用"
+        val swaps = StringBuilder()
+        var inSwaps = false
+        val processes = mutableListOf<ProcessItem>()
+        output.forEach { line ->
+            when {
+                line.startsWith("ZRAM|") -> zram = line.substringAfter('|').ifBlank { "不可用" }
+                line == "SWAPS_BEGIN" -> inSwaps = true
+                line == "SWAPS_END" -> inSwaps = false
+                inSwaps -> if (line.isNotBlank()) swaps.append(line).append("; ")
+                line.startsWith("PROC|") -> {
+                    val f = line.split('|', limit = 8)
+                    if (f.size == 8) processes.add(ProcessItem(
+                        f[1].toIntOrNull() ?: 0, f[2].toIntOrNull() ?: 0, f[3], f[4],
+                        f[5].toLongOrNull() ?: 0, f[6].toLongOrNull() ?: -1, f[7].toLongOrNull() ?: 0
+                    ))
+                }
+            }
+        }
+        val time = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US).format(Date())
+        return ScanResult(Snapshot(time, processes, zram, swaps.toString().ifBlank { "不可用" }), "", System.currentTimeMillis() - started)
+    }
+}
+}2} /^Swap:/{s+=${'2} END{printf "%d|%d",p,s}' "\${'$'}x/smaps" 2>/dev/null)
+                oldifs=\${'$'}IFS; IFS='|'; set -- \${'$'}mem; IFS=\${'$'}oldifs
+                pss=\${'$'}{1:--1}; swap=\${'$'}{2:-\${'$'}vswap}
+              fi
+              name=\${'$'}(printf '%s' "\${'$'}name" | tr '|\\t\\r\\n' '____')
+              echo "PROC|\${'$'}pid|\${'$'}uid|\${'$'}startticks|\${'$'}name|\${'$'}rss|\${'$'}pss|\${'$'}swap"
+              done_count=\${'$'}((done_count+1))
+              if [ "\${'$'}DETAIL" = "1" ]; then stage="详细 PSS"; else stage="基础扫描"; fi
+              echo "PROGRESS|\${'$'}done_count|\${'$'}total|\${'$'}stage|PID \${'$'}pid"
+            done
+            echo "SCAN_END"
+        """.trimIndent()
+
+        val process = try {
+            ProcessBuilder("su", "-c", script).redirectErrorStream(true).start()
+        } catch (e: Exception) {
+            return ScanResult(null, e.toString(), System.currentTimeMillis() - started)
+        }
+        val lines = java.util.Collections.synchronizedList(mutableListOf<String>())
+        var total = 0
+        val reader = thread(name = "pmm-stream-reader") {
+            try {
+                process.inputStream.bufferedReader().useLines { seq ->
+                    seq.forEach { line ->
+                        if (lines.size < 100000) lines.add(line)
+                        when {
+                            line.startsWith("TOTAL|") -> total = line.substringAfter('|').toIntOrNull() ?: 0
+                            line.startsWith("PROGRESS|") -> {
+                                val fields = line.split('|', limit = 5)
+                                if (fields.size >= 4) {
+                                    onProgress(fields[1].toIntOrNull() ?: 0, total, fields[3], fields.getOrElse(4) { "" })
+                                }
+                            }
+                        }
+                    }
+                }
+            } catch (_: Exception) {}
+        }
+        val finished = process.waitFor(if (detailed) 300 else 120, TimeUnit.SECONDS)
+        if (!finished) {
+            process.destroy()
+            if (process.isAlive) process.destroyForcibly()
+            reader.join(2000)
+            return ScanResult(null, "扫描超过时间限制（详细模式 300 秒 / 快速模式 120 秒）", System.currentTimeMillis() - started)
+        }
+        reader.join(2000)
+        val output = lines.toList()
+        if (process.exitValue() != 0 || "SCAN_END" !in output) {
+            return ScanResult(null, output.takeLast(35).joinToString("\n"), System.currentTimeMillis() - started)
+        }
+        var zram = "不可用"
+        val swaps = StringBuilder()
+        var inSwaps = false
+        val processes = mutableListOf<ProcessItem>()
+        output.forEach { line ->
+            when {
+                line.startsWith("ZRAM|") -> zram = line.substringAfter('|').ifBlank { "不可用" }
+                line == "SWAPS_BEGIN" -> inSwaps = true
+                line == "SWAPS_END" -> inSwaps = false
+                inSwaps -> if (line.isNotBlank()) swaps.append(line).append("; ")
+                line.startsWith("PROC|") -> {
+                    val f = line.split('|', limit = 8)
+                    if (f.size == 8) processes.add(ProcessItem(
+                        f[1].toIntOrNull() ?: 0, f[2].toIntOrNull() ?: 0, f[3], f[4],
+                        f[5].toLongOrNull() ?: 0, f[6].toLongOrNull() ?: -1, f[7].toLongOrNull() ?: 0
+                    ))
+                }
+            }
+        }
+        val time = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US).format(Date())
+        return ScanResult(Snapshot(time, processes, zram, swaps.toString().ifBlank { "不可用" }), "", System.currentTimeMillis() - started)
+    }
+}
+}2} END{printf "%d|%d",p,s}' "${'x/smaps" 2>/dev/null)
+                oldifs=\${'$'}IFS; IFS='|'; set -- \${'$'}mem; IFS=\${'$'}oldifs
+                pss=\${'$'}{1:--1}; swap=\${'$'}{2:-\${'$'}vswap}
+              fi
+              name=\${'$'}(printf '%s' "\${'$'}name" | tr '|\\t\\r\\n' '____')
+              echo "PROC|\${'$'}pid|\${'$'}uid|\${'$'}startticks|\${'$'}name|\${'$'}rss|\${'$'}pss|\${'$'}swap"
+              done_count=\${'$'}((done_count+1))
+              if [ "\${'$'}DETAIL" = "1" ]; then stage="详细 PSS"; else stage="基础扫描"; fi
+              echo "PROGRESS|\${'$'}done_count|\${'$'}total|\${'$'}stage|PID \${'$'}pid"
+            done
+            echo "SCAN_END"
+        """.trimIndent()
+
+        val process = try {
+            ProcessBuilder("su", "-c", script).redirectErrorStream(true).start()
+        } catch (e: Exception) {
+            return ScanResult(null, e.toString(), System.currentTimeMillis() - started)
+        }
+        val lines = java.util.Collections.synchronizedList(mutableListOf<String>())
+        var total = 0
+        val reader = thread(name = "pmm-stream-reader") {
+            try {
+                process.inputStream.bufferedReader().useLines { seq ->
+                    seq.forEach { line ->
+                        if (lines.size < 100000) lines.add(line)
+                        when {
+                            line.startsWith("TOTAL|") -> total = line.substringAfter('|').toIntOrNull() ?: 0
+                            line.startsWith("PROGRESS|") -> {
+                                val fields = line.split('|', limit = 5)
+                                if (fields.size >= 4) {
+                                    onProgress(fields[1].toIntOrNull() ?: 0, total, fields[3], fields.getOrElse(4) { "" })
+                                }
+                            }
+                        }
+                    }
+                }
+            } catch (_: Exception) {}
+        }
+        val finished = process.waitFor(if (detailed) 300 else 120, TimeUnit.SECONDS)
+        if (!finished) {
+            process.destroy()
+            if (process.isAlive) process.destroyForcibly()
+            reader.join(2000)
+            return ScanResult(null, "扫描超过时间限制（详细模式 300 秒 / 快速模式 120 秒）", System.currentTimeMillis() - started)
+        }
+        reader.join(2000)
+        val output = lines.toList()
+        if (process.exitValue() != 0 || "SCAN_END" !in output) {
+            return ScanResult(null, output.takeLast(35).joinToString("\n"), System.currentTimeMillis() - started)
+        }
+        var zram = "不可用"
+        val swaps = StringBuilder()
+        var inSwaps = false
+        val processes = mutableListOf<ProcessItem>()
+        output.forEach { line ->
+            when {
+                line.startsWith("ZRAM|") -> zram = line.substringAfter('|').ifBlank { "不可用" }
+                line == "SWAPS_BEGIN" -> inSwaps = true
+                line == "SWAPS_END" -> inSwaps = false
+                inSwaps -> if (line.isNotBlank()) swaps.append(line).append("; ")
+                line.startsWith("PROC|") -> {
+                    val f = line.split('|', limit = 8)
+                    if (f.size == 8) processes.add(ProcessItem(
+                        f[1].toIntOrNull() ?: 0, f[2].toIntOrNull() ?: 0, f[3], f[4],
+                        f[5].toLongOrNull() ?: 0, f[6].toLongOrNull() ?: -1, f[7].toLongOrNull() ?: 0
+                    ))
+                }
+            }
+        }
+        val time = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US).format(Date())
+        return ScanResult(Snapshot(time, processes, zram, swaps.toString().ifBlank { "不可用" }), "", System.currentTimeMillis() - started)
+    }
+}
+}x/smaps" 2>/dev/null)
+                oldifs=${'IFS; IFS='|'; set -- \${'$'}mem; IFS=\${'$'}oldifs
+                pss=\${'$'}{1:--1}; swap=\${'$'}{2:-\${'$'}vswap}
+              fi
+              name=\${'$'}(printf '%s' "\${'$'}name" | tr '|\\t\\r\\n' '____')
+              echo "PROC|\${'$'}pid|\${'$'}uid|\${'$'}startticks|\${'$'}name|\${'$'}rss|\${'$'}pss|\${'$'}swap"
+              done_count=\${'$'}((done_count+1))
+              if [ "\${'$'}DETAIL" = "1" ]; then stage="详细 PSS"; else stage="基础扫描"; fi
+              echo "PROGRESS|\${'$'}done_count|\${'$'}total|\${'$'}stage|PID \${'$'}pid"
+            done
+            echo "SCAN_END"
+        """.trimIndent()
+
+        val process = try {
+            ProcessBuilder("su", "-c", script).redirectErrorStream(true).start()
+        } catch (e: Exception) {
+            return ScanResult(null, e.toString(), System.currentTimeMillis() - started)
+        }
+        val lines = java.util.Collections.synchronizedList(mutableListOf<String>())
+        var total = 0
+        val reader = thread(name = "pmm-stream-reader") {
+            try {
+                process.inputStream.bufferedReader().useLines { seq ->
+                    seq.forEach { line ->
+                        if (lines.size < 100000) lines.add(line)
+                        when {
+                            line.startsWith("TOTAL|") -> total = line.substringAfter('|').toIntOrNull() ?: 0
+                            line.startsWith("PROGRESS|") -> {
+                                val fields = line.split('|', limit = 5)
+                                if (fields.size >= 4) {
+                                    onProgress(fields[1].toIntOrNull() ?: 0, total, fields[3], fields.getOrElse(4) { "" })
+                                }
+                            }
+                        }
+                    }
+                }
+            } catch (_: Exception) {}
+        }
+        val finished = process.waitFor(if (detailed) 300 else 120, TimeUnit.SECONDS)
+        if (!finished) {
+            process.destroy()
+            if (process.isAlive) process.destroyForcibly()
+            reader.join(2000)
+            return ScanResult(null, "扫描超过时间限制（详细模式 300 秒 / 快速模式 120 秒）", System.currentTimeMillis() - started)
+        }
+        reader.join(2000)
+        val output = lines.toList()
+        if (process.exitValue() != 0 || "SCAN_END" !in output) {
+            return ScanResult(null, output.takeLast(35).joinToString("\n"), System.currentTimeMillis() - started)
+        }
+        var zram = "不可用"
+        val swaps = StringBuilder()
+        var inSwaps = false
+        val processes = mutableListOf<ProcessItem>()
+        output.forEach { line ->
+            when {
+                line.startsWith("ZRAM|") -> zram = line.substringAfter('|').ifBlank { "不可用" }
+                line == "SWAPS_BEGIN" -> inSwaps = true
+                line == "SWAPS_END" -> inSwaps = false
+                inSwaps -> if (line.isNotBlank()) swaps.append(line).append("; ")
+                line.startsWith("PROC|") -> {
+                    val f = line.split('|', limit = 8)
+                    if (f.size == 8) processes.add(ProcessItem(
+                        f[1].toIntOrNull() ?: 0, f[2].toIntOrNull() ?: 0, f[3], f[4],
+                        f[5].toLongOrNull() ?: 0, f[6].toLongOrNull() ?: -1, f[7].toLongOrNull() ?: 0
+                    ))
+                }
+            }
+        }
+        val time = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US).format(Date())
+        return ScanResult(Snapshot(time, processes, zram, swaps.toString().ifBlank { "不可用" }), "", System.currentTimeMillis() - started)
+    }
+}
+}IFS; IFS='|'; set -- ${'mem; IFS=\${'$'}oldifs
+                pss=\${'$'}{1:--1}; swap=\${'$'}{2:-\${'$'}vswap}
+              fi
+              name=\${'$'}(printf '%s' "\${'$'}name" | tr '|\\t\\r\\n' '____')
+              echo "PROC|\${'$'}pid|\${'$'}uid|\${'$'}startticks|\${'$'}name|\${'$'}rss|\${'$'}pss|\${'$'}swap"
+              done_count=\${'$'}((done_count+1))
+              if [ "\${'$'}DETAIL" = "1" ]; then stage="详细 PSS"; else stage="基础扫描"; fi
+              echo "PROGRESS|\${'$'}done_count|\${'$'}total|\${'$'}stage|PID \${'$'}pid"
+            done
+            echo "SCAN_END"
+        """.trimIndent()
+
+        val process = try {
+            ProcessBuilder("su", "-c", script).redirectErrorStream(true).start()
+        } catch (e: Exception) {
+            return ScanResult(null, e.toString(), System.currentTimeMillis() - started)
+        }
+        val lines = java.util.Collections.synchronizedList(mutableListOf<String>())
+        var total = 0
+        val reader = thread(name = "pmm-stream-reader") {
+            try {
+                process.inputStream.bufferedReader().useLines { seq ->
+                    seq.forEach { line ->
+                        if (lines.size < 100000) lines.add(line)
+                        when {
+                            line.startsWith("TOTAL|") -> total = line.substringAfter('|').toIntOrNull() ?: 0
+                            line.startsWith("PROGRESS|") -> {
+                                val fields = line.split('|', limit = 5)
+                                if (fields.size >= 4) {
+                                    onProgress(fields[1].toIntOrNull() ?: 0, total, fields[3], fields.getOrElse(4) { "" })
+                                }
+                            }
+                        }
+                    }
+                }
+            } catch (_: Exception) {}
+        }
+        val finished = process.waitFor(if (detailed) 300 else 120, TimeUnit.SECONDS)
+        if (!finished) {
+            process.destroy()
+            if (process.isAlive) process.destroyForcibly()
+            reader.join(2000)
+            return ScanResult(null, "扫描超过时间限制（详细模式 300 秒 / 快速模式 120 秒）", System.currentTimeMillis() - started)
+        }
+        reader.join(2000)
+        val output = lines.toList()
+        if (process.exitValue() != 0 || "SCAN_END" !in output) {
+            return ScanResult(null, output.takeLast(35).joinToString("\n"), System.currentTimeMillis() - started)
+        }
+        var zram = "不可用"
+        val swaps = StringBuilder()
+        var inSwaps = false
+        val processes = mutableListOf<ProcessItem>()
+        output.forEach { line ->
+            when {
+                line.startsWith("ZRAM|") -> zram = line.substringAfter('|').ifBlank { "不可用" }
+                line == "SWAPS_BEGIN" -> inSwaps = true
+                line == "SWAPS_END" -> inSwaps = false
+                inSwaps -> if (line.isNotBlank()) swaps.append(line).append("; ")
+                line.startsWith("PROC|") -> {
+                    val f = line.split('|', limit = 8)
+                    if (f.size == 8) processes.add(ProcessItem(
+                        f[1].toIntOrNull() ?: 0, f[2].toIntOrNull() ?: 0, f[3], f[4],
+                        f[5].toLongOrNull() ?: 0, f[6].toLongOrNull() ?: -1, f[7].toLongOrNull() ?: 0
+                    ))
+                }
+            }
+        }
+        val time = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US).format(Date())
+        return ScanResult(Snapshot(time, processes, zram, swaps.toString().ifBlank { "不可用" }), "", System.currentTimeMillis() - started)
+    }
+}
+}mem; IFS=${'oldifs
+                pss=\${'$'}{1:--1}; swap=\${'$'}{2:-\${'$'}vswap}
+              fi
+              name=\${'$'}(printf '%s' "\${'$'}name" | tr '|\\t\\r\\n' '____')
+              echo "PROC|\${'$'}pid|\${'$'}uid|\${'$'}startticks|\${'$'}name|\${'$'}rss|\${'$'}pss|\${'$'}swap"
+              done_count=\${'$'}((done_count+1))
+              if [ "\${'$'}DETAIL" = "1" ]; then stage="详细 PSS"; else stage="基础扫描"; fi
+              echo "PROGRESS|\${'$'}done_count|\${'$'}total|\${'$'}stage|PID \${'$'}pid"
+            done
+            echo "SCAN_END"
+        """.trimIndent()
+
+        val process = try {
+            ProcessBuilder("su", "-c", script).redirectErrorStream(true).start()
+        } catch (e: Exception) {
+            return ScanResult(null, e.toString(), System.currentTimeMillis() - started)
+        }
+        val lines = java.util.Collections.synchronizedList(mutableListOf<String>())
+        var total = 0
+        val reader = thread(name = "pmm-stream-reader") {
+            try {
+                process.inputStream.bufferedReader().useLines { seq ->
+                    seq.forEach { line ->
+                        if (lines.size < 100000) lines.add(line)
+                        when {
+                            line.startsWith("TOTAL|") -> total = line.substringAfter('|').toIntOrNull() ?: 0
+                            line.startsWith("PROGRESS|") -> {
+                                val fields = line.split('|', limit = 5)
+                                if (fields.size >= 4) {
+                                    onProgress(fields[1].toIntOrNull() ?: 0, total, fields[3], fields.getOrElse(4) { "" })
+                                }
+                            }
+                        }
+                    }
+                }
+            } catch (_: Exception) {}
+        }
+        val finished = process.waitFor(if (detailed) 300 else 120, TimeUnit.SECONDS)
+        if (!finished) {
+            process.destroy()
+            if (process.isAlive) process.destroyForcibly()
+            reader.join(2000)
+            return ScanResult(null, "扫描超过时间限制（详细模式 300 秒 / 快速模式 120 秒）", System.currentTimeMillis() - started)
+        }
+        reader.join(2000)
+        val output = lines.toList()
+        if (process.exitValue() != 0 || "SCAN_END" !in output) {
+            return ScanResult(null, output.takeLast(35).joinToString("\n"), System.currentTimeMillis() - started)
+        }
+        var zram = "不可用"
+        val swaps = StringBuilder()
+        var inSwaps = false
+        val processes = mutableListOf<ProcessItem>()
+        output.forEach { line ->
+            when {
+                line.startsWith("ZRAM|") -> zram = line.substringAfter('|').ifBlank { "不可用" }
+                line == "SWAPS_BEGIN" -> inSwaps = true
+                line == "SWAPS_END" -> inSwaps = false
+                inSwaps -> if (line.isNotBlank()) swaps.append(line).append("; ")
+                line.startsWith("PROC|") -> {
+                    val f = line.split('|', limit = 8)
+                    if (f.size == 8) processes.add(ProcessItem(
+                        f[1].toIntOrNull() ?: 0, f[2].toIntOrNull() ?: 0, f[3], f[4],
+                        f[5].toLongOrNull() ?: 0, f[6].toLongOrNull() ?: -1, f[7].toLongOrNull() ?: 0
+                    ))
+                }
+            }
+        }
+        val time = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US).format(Date())
+        return ScanResult(Snapshot(time, processes, zram, swaps.toString().ifBlank { "不可用" }), "", System.currentTimeMillis() - started)
+    }
+}
+}oldifs
+                pss=${'{1:--1}; swap=\${'$'}{2:-\${'$'}vswap}
+              fi
+              name=\${'$'}(printf '%s' "\${'$'}name" | tr '|\\t\\r\\n' '____')
+              echo "PROC|\${'$'}pid|\${'$'}uid|\${'$'}startticks|\${'$'}name|\${'$'}rss|\${'$'}pss|\${'$'}swap"
+              done_count=\${'$'}((done_count+1))
+              if [ "\${'$'}DETAIL" = "1" ]; then stage="详细 PSS"; else stage="基础扫描"; fi
+              echo "PROGRESS|\${'$'}done_count|\${'$'}total|\${'$'}stage|PID \${'$'}pid"
+            done
+            echo "SCAN_END"
+        """.trimIndent()
+
+        val process = try {
+            ProcessBuilder("su", "-c", script).redirectErrorStream(true).start()
+        } catch (e: Exception) {
+            return ScanResult(null, e.toString(), System.currentTimeMillis() - started)
+        }
+        val lines = java.util.Collections.synchronizedList(mutableListOf<String>())
+        var total = 0
+        val reader = thread(name = "pmm-stream-reader") {
+            try {
+                process.inputStream.bufferedReader().useLines { seq ->
+                    seq.forEach { line ->
+                        if (lines.size < 100000) lines.add(line)
+                        when {
+                            line.startsWith("TOTAL|") -> total = line.substringAfter('|').toIntOrNull() ?: 0
+                            line.startsWith("PROGRESS|") -> {
+                                val fields = line.split('|', limit = 5)
+                                if (fields.size >= 4) {
+                                    onProgress(fields[1].toIntOrNull() ?: 0, total, fields[3], fields.getOrElse(4) { "" })
+                                }
+                            }
+                        }
+                    }
+                }
+            } catch (_: Exception) {}
+        }
+        val finished = process.waitFor(if (detailed) 300 else 120, TimeUnit.SECONDS)
+        if (!finished) {
+            process.destroy()
+            if (process.isAlive) process.destroyForcibly()
+            reader.join(2000)
+            return ScanResult(null, "扫描超过时间限制（详细模式 300 秒 / 快速模式 120 秒）", System.currentTimeMillis() - started)
+        }
+        reader.join(2000)
+        val output = lines.toList()
+        if (process.exitValue() != 0 || "SCAN_END" !in output) {
+            return ScanResult(null, output.takeLast(35).joinToString("\n"), System.currentTimeMillis() - started)
+        }
+        var zram = "不可用"
+        val swaps = StringBuilder()
+        var inSwaps = false
+        val processes = mutableListOf<ProcessItem>()
+        output.forEach { line ->
+            when {
+                line.startsWith("ZRAM|") -> zram = line.substringAfter('|').ifBlank { "不可用" }
+                line == "SWAPS_BEGIN" -> inSwaps = true
+                line == "SWAPS_END" -> inSwaps = false
+                inSwaps -> if (line.isNotBlank()) swaps.append(line).append("; ")
+                line.startsWith("PROC|") -> {
+                    val f = line.split('|', limit = 8)
+                    if (f.size == 8) processes.add(ProcessItem(
+                        f[1].toIntOrNull() ?: 0, f[2].toIntOrNull() ?: 0, f[3], f[4],
+                        f[5].toLongOrNull() ?: 0, f[6].toLongOrNull() ?: -1, f[7].toLongOrNull() ?: 0
+                    ))
+                }
+            }
+        }
+        val time = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US).format(Date())
+        return ScanResult(Snapshot(time, processes, zram, swaps.toString().ifBlank { "不可用" }), "", System.currentTimeMillis() - started)
+    }
+}
+}{1:--1}; swap=${'{2:-\${'$'}vswap}
+              fi
+              name=\${'$'}(printf '%s' "\${'$'}name" | tr '|\\t\\r\\n' '____')
+              echo "PROC|\${'$'}pid|\${'$'}uid|\${'$'}startticks|\${'$'}name|\${'$'}rss|\${'$'}pss|\${'$'}swap"
+              done_count=\${'$'}((done_count+1))
+              if [ "\${'$'}DETAIL" = "1" ]; then stage="详细 PSS"; else stage="基础扫描"; fi
+              echo "PROGRESS|\${'$'}done_count|\${'$'}total|\${'$'}stage|PID \${'$'}pid"
+            done
+            echo "SCAN_END"
+        """.trimIndent()
+
+        val process = try {
+            ProcessBuilder("su", "-c", script).redirectErrorStream(true).start()
+        } catch (e: Exception) {
+            return ScanResult(null, e.toString(), System.currentTimeMillis() - started)
+        }
+        val lines = java.util.Collections.synchronizedList(mutableListOf<String>())
+        var total = 0
+        val reader = thread(name = "pmm-stream-reader") {
+            try {
+                process.inputStream.bufferedReader().useLines { seq ->
+                    seq.forEach { line ->
+                        if (lines.size < 100000) lines.add(line)
+                        when {
+                            line.startsWith("TOTAL|") -> total = line.substringAfter('|').toIntOrNull() ?: 0
+                            line.startsWith("PROGRESS|") -> {
+                                val fields = line.split('|', limit = 5)
+                                if (fields.size >= 4) {
+                                    onProgress(fields[1].toIntOrNull() ?: 0, total, fields[3], fields.getOrElse(4) { "" })
+                                }
+                            }
+                        }
+                    }
+                }
+            } catch (_: Exception) {}
+        }
+        val finished = process.waitFor(if (detailed) 300 else 120, TimeUnit.SECONDS)
+        if (!finished) {
+            process.destroy()
+            if (process.isAlive) process.destroyForcibly()
+            reader.join(2000)
+            return ScanResult(null, "扫描超过时间限制（详细模式 300 秒 / 快速模式 120 秒）", System.currentTimeMillis() - started)
+        }
+        reader.join(2000)
+        val output = lines.toList()
+        if (process.exitValue() != 0 || "SCAN_END" !in output) {
+            return ScanResult(null, output.takeLast(35).joinToString("\n"), System.currentTimeMillis() - started)
+        }
+        var zram = "不可用"
+        val swaps = StringBuilder()
+        var inSwaps = false
+        val processes = mutableListOf<ProcessItem>()
+        output.forEach { line ->
+            when {
+                line.startsWith("ZRAM|") -> zram = line.substringAfter('|').ifBlank { "不可用" }
+                line == "SWAPS_BEGIN" -> inSwaps = true
+                line == "SWAPS_END" -> inSwaps = false
+                inSwaps -> if (line.isNotBlank()) swaps.append(line).append("; ")
+                line.startsWith("PROC|") -> {
+                    val f = line.split('|', limit = 8)
+                    if (f.size == 8) processes.add(ProcessItem(
+                        f[1].toIntOrNull() ?: 0, f[2].toIntOrNull() ?: 0, f[3], f[4],
+                        f[5].toLongOrNull() ?: 0, f[6].toLongOrNull() ?: -1, f[7].toLongOrNull() ?: 0
+                    ))
+                }
+            }
+        }
+        val time = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US).format(Date())
+        return ScanResult(Snapshot(time, processes, zram, swaps.toString().ifBlank { "不可用" }), "", System.currentTimeMillis() - started)
+    }
+}
+}{2:-${'vswap}
+              fi
+              name=\${'$'}(printf '%s' "\${'$'}name" | tr '|\\t\\r\\n' '____')
+              echo "PROC|\${'$'}pid|\${'$'}uid|\${'$'}startticks|\${'$'}name|\${'$'}rss|\${'$'}pss|\${'$'}swap"
+              done_count=\${'$'}((done_count+1))
+              if [ "\${'$'}DETAIL" = "1" ]; then stage="详细 PSS"; else stage="基础扫描"; fi
+              echo "PROGRESS|\${'$'}done_count|\${'$'}total|\${'$'}stage|PID \${'$'}pid"
+            done
+            echo "SCAN_END"
+        """.trimIndent()
+
+        val process = try {
+            ProcessBuilder("su", "-c", script).redirectErrorStream(true).start()
+        } catch (e: Exception) {
+            return ScanResult(null, e.toString(), System.currentTimeMillis() - started)
+        }
+        val lines = java.util.Collections.synchronizedList(mutableListOf<String>())
+        var total = 0
+        val reader = thread(name = "pmm-stream-reader") {
+            try {
+                process.inputStream.bufferedReader().useLines { seq ->
+                    seq.forEach { line ->
+                        if (lines.size < 100000) lines.add(line)
+                        when {
+                            line.startsWith("TOTAL|") -> total = line.substringAfter('|').toIntOrNull() ?: 0
+                            line.startsWith("PROGRESS|") -> {
+                                val fields = line.split('|', limit = 5)
+                                if (fields.size >= 4) {
+                                    onProgress(fields[1].toIntOrNull() ?: 0, total, fields[3], fields.getOrElse(4) { "" })
+                                }
+                            }
+                        }
+                    }
+                }
+            } catch (_: Exception) {}
+        }
+        val finished = process.waitFor(if (detailed) 300 else 120, TimeUnit.SECONDS)
+        if (!finished) {
+            process.destroy()
+            if (process.isAlive) process.destroyForcibly()
+            reader.join(2000)
+            return ScanResult(null, "扫描超过时间限制（详细模式 300 秒 / 快速模式 120 秒）", System.currentTimeMillis() - started)
+        }
+        reader.join(2000)
+        val output = lines.toList()
+        if (process.exitValue() != 0 || "SCAN_END" !in output) {
+            return ScanResult(null, output.takeLast(35).joinToString("\n"), System.currentTimeMillis() - started)
+        }
+        var zram = "不可用"
+        val swaps = StringBuilder()
+        var inSwaps = false
+        val processes = mutableListOf<ProcessItem>()
+        output.forEach { line ->
+            when {
+                line.startsWith("ZRAM|") -> zram = line.substringAfter('|').ifBlank { "不可用" }
+                line == "SWAPS_BEGIN" -> inSwaps = true
+                line == "SWAPS_END" -> inSwaps = false
+                inSwaps -> if (line.isNotBlank()) swaps.append(line).append("; ")
+                line.startsWith("PROC|") -> {
+                    val f = line.split('|', limit = 8)
+                    if (f.size == 8) processes.add(ProcessItem(
+                        f[1].toIntOrNull() ?: 0, f[2].toIntOrNull() ?: 0, f[3], f[4],
+                        f[5].toLongOrNull() ?: 0, f[6].toLongOrNull() ?: -1, f[7].toLongOrNull() ?: 0
+                    ))
+                }
+            }
+        }
+        val time = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US).format(Date())
+        return ScanResult(Snapshot(time, processes, zram, swaps.toString().ifBlank { "不可用" }), "", System.currentTimeMillis() - started)
+    }
+}
+}vswap}
+              fi
+              name=${'(printf '%s' "\${'$'}name" | tr '|\\t\\r\\n' '____')
+              echo "PROC|\${'$'}pid|\${'$'}uid|\${'$'}startticks|\${'$'}name|\${'$'}rss|\${'$'}pss|\${'$'}swap"
+              done_count=\${'$'}((done_count+1))
+              if [ "\${'$'}DETAIL" = "1" ]; then stage="详细 PSS"; else stage="基础扫描"; fi
+              echo "PROGRESS|\${'$'}done_count|\${'$'}total|\${'$'}stage|PID \${'$'}pid"
+            done
+            echo "SCAN_END"
+        """.trimIndent()
+
+        val process = try {
+            ProcessBuilder("su", "-c", script).redirectErrorStream(true).start()
+        } catch (e: Exception) {
+            return ScanResult(null, e.toString(), System.currentTimeMillis() - started)
+        }
+        val lines = java.util.Collections.synchronizedList(mutableListOf<String>())
+        var total = 0
+        val reader = thread(name = "pmm-stream-reader") {
+            try {
+                process.inputStream.bufferedReader().useLines { seq ->
+                    seq.forEach { line ->
+                        if (lines.size < 100000) lines.add(line)
+                        when {
+                            line.startsWith("TOTAL|") -> total = line.substringAfter('|').toIntOrNull() ?: 0
+                            line.startsWith("PROGRESS|") -> {
+                                val fields = line.split('|', limit = 5)
+                                if (fields.size >= 4) {
+                                    onProgress(fields[1].toIntOrNull() ?: 0, total, fields[3], fields.getOrElse(4) { "" })
+                                }
+                            }
+                        }
+                    }
+                }
+            } catch (_: Exception) {}
+        }
+        val finished = process.waitFor(if (detailed) 300 else 120, TimeUnit.SECONDS)
+        if (!finished) {
+            process.destroy()
+            if (process.isAlive) process.destroyForcibly()
+            reader.join(2000)
+            return ScanResult(null, "扫描超过时间限制（详细模式 300 秒 / 快速模式 120 秒）", System.currentTimeMillis() - started)
+        }
+        reader.join(2000)
+        val output = lines.toList()
+        if (process.exitValue() != 0 || "SCAN_END" !in output) {
+            return ScanResult(null, output.takeLast(35).joinToString("\n"), System.currentTimeMillis() - started)
+        }
+        var zram = "不可用"
+        val swaps = StringBuilder()
+        var inSwaps = false
+        val processes = mutableListOf<ProcessItem>()
+        output.forEach { line ->
+            when {
+                line.startsWith("ZRAM|") -> zram = line.substringAfter('|').ifBlank { "不可用" }
+                line == "SWAPS_BEGIN" -> inSwaps = true
+                line == "SWAPS_END" -> inSwaps = false
+                inSwaps -> if (line.isNotBlank()) swaps.append(line).append("; ")
+                line.startsWith("PROC|") -> {
+                    val f = line.split('|', limit = 8)
+                    if (f.size == 8) processes.add(ProcessItem(
+                        f[1].toIntOrNull() ?: 0, f[2].toIntOrNull() ?: 0, f[3], f[4],
+                        f[5].toLongOrNull() ?: 0, f[6].toLongOrNull() ?: -1, f[7].toLongOrNull() ?: 0
+                    ))
+                }
+            }
+        }
+        val time = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US).format(Date())
+        return ScanResult(Snapshot(time, processes, zram, swaps.toString().ifBlank { "不可用" }), "", System.currentTimeMillis() - started)
+    }
+}
+}(printf '%s' "${'name" | tr '|\\t\\r\\n' '____')
+              echo "PROC|\${'$'}pid|\${'$'}uid|\${'$'}startticks|\${'$'}name|\${'$'}rss|\${'$'}pss|\${'$'}swap"
+              done_count=\${'$'}((done_count+1))
+              if [ "\${'$'}DETAIL" = "1" ]; then stage="详细 PSS"; else stage="基础扫描"; fi
+              echo "PROGRESS|\${'$'}done_count|\${'$'}total|\${'$'}stage|PID \${'$'}pid"
+            done
+            echo "SCAN_END"
+        """.trimIndent()
+
+        val process = try {
+            ProcessBuilder("su", "-c", script).redirectErrorStream(true).start()
+        } catch (e: Exception) {
+            return ScanResult(null, e.toString(), System.currentTimeMillis() - started)
+        }
+        val lines = java.util.Collections.synchronizedList(mutableListOf<String>())
+        var total = 0
+        val reader = thread(name = "pmm-stream-reader") {
+            try {
+                process.inputStream.bufferedReader().useLines { seq ->
+                    seq.forEach { line ->
+                        if (lines.size < 100000) lines.add(line)
+                        when {
+                            line.startsWith("TOTAL|") -> total = line.substringAfter('|').toIntOrNull() ?: 0
+                            line.startsWith("PROGRESS|") -> {
+                                val fields = line.split('|', limit = 5)
+                                if (fields.size >= 4) {
+                                    onProgress(fields[1].toIntOrNull() ?: 0, total, fields[3], fields.getOrElse(4) { "" })
+                                }
+                            }
+                        }
+                    }
+                }
+            } catch (_: Exception) {}
+        }
+        val finished = process.waitFor(if (detailed) 300 else 120, TimeUnit.SECONDS)
+        if (!finished) {
+            process.destroy()
+            if (process.isAlive) process.destroyForcibly()
+            reader.join(2000)
+            return ScanResult(null, "扫描超过时间限制（详细模式 300 秒 / 快速模式 120 秒）", System.currentTimeMillis() - started)
+        }
+        reader.join(2000)
+        val output = lines.toList()
+        if (process.exitValue() != 0 || "SCAN_END" !in output) {
+            return ScanResult(null, output.takeLast(35).joinToString("\n"), System.currentTimeMillis() - started)
+        }
+        var zram = "不可用"
+        val swaps = StringBuilder()
+        var inSwaps = false
+        val processes = mutableListOf<ProcessItem>()
+        output.forEach { line ->
+            when {
+                line.startsWith("ZRAM|") -> zram = line.substringAfter('|').ifBlank { "不可用" }
+                line == "SWAPS_BEGIN" -> inSwaps = true
+                line == "SWAPS_END" -> inSwaps = false
+                inSwaps -> if (line.isNotBlank()) swaps.append(line).append("; ")
+                line.startsWith("PROC|") -> {
+                    val f = line.split('|', limit = 8)
+                    if (f.size == 8) processes.add(ProcessItem(
+                        f[1].toIntOrNull() ?: 0, f[2].toIntOrNull() ?: 0, f[3], f[4],
+                        f[5].toLongOrNull() ?: 0, f[6].toLongOrNull() ?: -1, f[7].toLongOrNull() ?: 0
+                    ))
+                }
+            }
+        }
+        val time = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US).format(Date())
+        return ScanResult(Snapshot(time, processes, zram, swaps.toString().ifBlank { "不可用" }), "", System.currentTimeMillis() - started)
+    }
+}
+}name" | tr '|\\t\\r\\n' '____')
+              echo "PROC|${'pid|\${'$'}uid|\${'$'}startticks|\${'$'}name|\${'$'}rss|\${'$'}pss|\${'$'}swap"
+              done_count=\${'$'}((done_count+1))
+              if [ "\${'$'}DETAIL" = "1" ]; then stage="详细 PSS"; else stage="基础扫描"; fi
+              echo "PROGRESS|\${'$'}done_count|\${'$'}total|\${'$'}stage|PID \${'$'}pid"
+            done
+            echo "SCAN_END"
+        """.trimIndent()
+
+        val process = try {
+            ProcessBuilder("su", "-c", script).redirectErrorStream(true).start()
+        } catch (e: Exception) {
+            return ScanResult(null, e.toString(), System.currentTimeMillis() - started)
+        }
+        val lines = java.util.Collections.synchronizedList(mutableListOf<String>())
+        var total = 0
+        val reader = thread(name = "pmm-stream-reader") {
+            try {
+                process.inputStream.bufferedReader().useLines { seq ->
+                    seq.forEach { line ->
+                        if (lines.size < 100000) lines.add(line)
+                        when {
+                            line.startsWith("TOTAL|") -> total = line.substringAfter('|').toIntOrNull() ?: 0
+                            line.startsWith("PROGRESS|") -> {
+                                val fields = line.split('|', limit = 5)
+                                if (fields.size >= 4) {
+                                    onProgress(fields[1].toIntOrNull() ?: 0, total, fields[3], fields.getOrElse(4) { "" })
+                                }
+                            }
+                        }
+                    }
+                }
+            } catch (_: Exception) {}
+        }
+        val finished = process.waitFor(if (detailed) 300 else 120, TimeUnit.SECONDS)
+        if (!finished) {
+            process.destroy()
+            if (process.isAlive) process.destroyForcibly()
+            reader.join(2000)
+            return ScanResult(null, "扫描超过时间限制（详细模式 300 秒 / 快速模式 120 秒）", System.currentTimeMillis() - started)
+        }
+        reader.join(2000)
+        val output = lines.toList()
+        if (process.exitValue() != 0 || "SCAN_END" !in output) {
+            return ScanResult(null, output.takeLast(35).joinToString("\n"), System.currentTimeMillis() - started)
+        }
+        var zram = "不可用"
+        val swaps = StringBuilder()
+        var inSwaps = false
+        val processes = mutableListOf<ProcessItem>()
+        output.forEach { line ->
+            when {
+                line.startsWith("ZRAM|") -> zram = line.substringAfter('|').ifBlank { "不可用" }
+                line == "SWAPS_BEGIN" -> inSwaps = true
+                line == "SWAPS_END" -> inSwaps = false
+                inSwaps -> if (line.isNotBlank()) swaps.append(line).append("; ")
+                line.startsWith("PROC|") -> {
+                    val f = line.split('|', limit = 8)
+                    if (f.size == 8) processes.add(ProcessItem(
+                        f[1].toIntOrNull() ?: 0, f[2].toIntOrNull() ?: 0, f[3], f[4],
+                        f[5].toLongOrNull() ?: 0, f[6].toLongOrNull() ?: -1, f[7].toLongOrNull() ?: 0
+                    ))
+                }
+            }
+        }
+        val time = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US).format(Date())
+        return ScanResult(Snapshot(time, processes, zram, swaps.toString().ifBlank { "不可用" }), "", System.currentTimeMillis() - started)
+    }
+}
+}pid|${'uid|\${'$'}startticks|\${'$'}name|\${'$'}rss|\${'$'}pss|\${'$'}swap"
+              done_count=\${'$'}((done_count+1))
+              if [ "\${'$'}DETAIL" = "1" ]; then stage="详细 PSS"; else stage="基础扫描"; fi
+              echo "PROGRESS|\${'$'}done_count|\${'$'}total|\${'$'}stage|PID \${'$'}pid"
+            done
+            echo "SCAN_END"
+        """.trimIndent()
+
+        val process = try {
+            ProcessBuilder("su", "-c", script).redirectErrorStream(true).start()
+        } catch (e: Exception) {
+            return ScanResult(null, e.toString(), System.currentTimeMillis() - started)
+        }
+        val lines = java.util.Collections.synchronizedList(mutableListOf<String>())
+        var total = 0
+        val reader = thread(name = "pmm-stream-reader") {
+            try {
+                process.inputStream.bufferedReader().useLines { seq ->
+                    seq.forEach { line ->
+                        if (lines.size < 100000) lines.add(line)
+                        when {
+                            line.startsWith("TOTAL|") -> total = line.substringAfter('|').toIntOrNull() ?: 0
+                            line.startsWith("PROGRESS|") -> {
+                                val fields = line.split('|', limit = 5)
+                                if (fields.size >= 4) {
+                                    onProgress(fields[1].toIntOrNull() ?: 0, total, fields[3], fields.getOrElse(4) { "" })
+                                }
+                            }
+                        }
+                    }
+                }
+            } catch (_: Exception) {}
+        }
+        val finished = process.waitFor(if (detailed) 300 else 120, TimeUnit.SECONDS)
+        if (!finished) {
+            process.destroy()
+            if (process.isAlive) process.destroyForcibly()
+            reader.join(2000)
+            return ScanResult(null, "扫描超过时间限制（详细模式 300 秒 / 快速模式 120 秒）", System.currentTimeMillis() - started)
+        }
+        reader.join(2000)
+        val output = lines.toList()
+        if (process.exitValue() != 0 || "SCAN_END" !in output) {
+            return ScanResult(null, output.takeLast(35).joinToString("\n"), System.currentTimeMillis() - started)
+        }
+        var zram = "不可用"
+        val swaps = StringBuilder()
+        var inSwaps = false
+        val processes = mutableListOf<ProcessItem>()
+        output.forEach { line ->
+            when {
+                line.startsWith("ZRAM|") -> zram = line.substringAfter('|').ifBlank { "不可用" }
+                line == "SWAPS_BEGIN" -> inSwaps = true
+                line == "SWAPS_END" -> inSwaps = false
+                inSwaps -> if (line.isNotBlank()) swaps.append(line).append("; ")
+                line.startsWith("PROC|") -> {
+                    val f = line.split('|', limit = 8)
+                    if (f.size == 8) processes.add(ProcessItem(
+                        f[1].toIntOrNull() ?: 0, f[2].toIntOrNull() ?: 0, f[3], f[4],
+                        f[5].toLongOrNull() ?: 0, f[6].toLongOrNull() ?: -1, f[7].toLongOrNull() ?: 0
+                    ))
+                }
+            }
+        }
+        val time = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US).format(Date())
+        return ScanResult(Snapshot(time, processes, zram, swaps.toString().ifBlank { "不可用" }), "", System.currentTimeMillis() - started)
+    }
+}
+}uid|${'startticks|\${'$'}name|\${'$'}rss|\${'$'}pss|\${'$'}swap"
+              done_count=\${'$'}((done_count+1))
+              if [ "\${'$'}DETAIL" = "1" ]; then stage="详细 PSS"; else stage="基础扫描"; fi
+              echo "PROGRESS|\${'$'}done_count|\${'$'}total|\${'$'}stage|PID \${'$'}pid"
+            done
+            echo "SCAN_END"
+        """.trimIndent()
+
+        val process = try {
+            ProcessBuilder("su", "-c", script).redirectErrorStream(true).start()
+        } catch (e: Exception) {
+            return ScanResult(null, e.toString(), System.currentTimeMillis() - started)
+        }
+        val lines = java.util.Collections.synchronizedList(mutableListOf<String>())
+        var total = 0
+        val reader = thread(name = "pmm-stream-reader") {
+            try {
+                process.inputStream.bufferedReader().useLines { seq ->
+                    seq.forEach { line ->
+                        if (lines.size < 100000) lines.add(line)
+                        when {
+                            line.startsWith("TOTAL|") -> total = line.substringAfter('|').toIntOrNull() ?: 0
+                            line.startsWith("PROGRESS|") -> {
+                                val fields = line.split('|', limit = 5)
+                                if (fields.size >= 4) {
+                                    onProgress(fields[1].toIntOrNull() ?: 0, total, fields[3], fields.getOrElse(4) { "" })
+                                }
+                            }
+                        }
+                    }
+                }
+            } catch (_: Exception) {}
+        }
+        val finished = process.waitFor(if (detailed) 300 else 120, TimeUnit.SECONDS)
+        if (!finished) {
+            process.destroy()
+            if (process.isAlive) process.destroyForcibly()
+            reader.join(2000)
+            return ScanResult(null, "扫描超过时间限制（详细模式 300 秒 / 快速模式 120 秒）", System.currentTimeMillis() - started)
+        }
+        reader.join(2000)
+        val output = lines.toList()
+        if (process.exitValue() != 0 || "SCAN_END" !in output) {
+            return ScanResult(null, output.takeLast(35).joinToString("\n"), System.currentTimeMillis() - started)
+        }
+        var zram = "不可用"
+        val swaps = StringBuilder()
+        var inSwaps = false
+        val processes = mutableListOf<ProcessItem>()
+        output.forEach { line ->
+            when {
+                line.startsWith("ZRAM|") -> zram = line.substringAfter('|').ifBlank { "不可用" }
+                line == "SWAPS_BEGIN" -> inSwaps = true
+                line == "SWAPS_END" -> inSwaps = false
+                inSwaps -> if (line.isNotBlank()) swaps.append(line).append("; ")
+                line.startsWith("PROC|") -> {
+                    val f = line.split('|', limit = 8)
+                    if (f.size == 8) processes.add(ProcessItem(
+                        f[1].toIntOrNull() ?: 0, f[2].toIntOrNull() ?: 0, f[3], f[4],
+                        f[5].toLongOrNull() ?: 0, f[6].toLongOrNull() ?: -1, f[7].toLongOrNull() ?: 0
+                    ))
+                }
+            }
+        }
+        val time = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US).format(Date())
+        return ScanResult(Snapshot(time, processes, zram, swaps.toString().ifBlank { "不可用" }), "", System.currentTimeMillis() - started)
+    }
+}
+}startticks|${'name|\${'$'}rss|\${'$'}pss|\${'$'}swap"
+              done_count=\${'$'}((done_count+1))
+              if [ "\${'$'}DETAIL" = "1" ]; then stage="详细 PSS"; else stage="基础扫描"; fi
+              echo "PROGRESS|\${'$'}done_count|\${'$'}total|\${'$'}stage|PID \${'$'}pid"
+            done
+            echo "SCAN_END"
+        """.trimIndent()
+
+        val process = try {
+            ProcessBuilder("su", "-c", script).redirectErrorStream(true).start()
+        } catch (e: Exception) {
+            return ScanResult(null, e.toString(), System.currentTimeMillis() - started)
+        }
+        val lines = java.util.Collections.synchronizedList(mutableListOf<String>())
+        var total = 0
+        val reader = thread(name = "pmm-stream-reader") {
+            try {
+                process.inputStream.bufferedReader().useLines { seq ->
+                    seq.forEach { line ->
+                        if (lines.size < 100000) lines.add(line)
+                        when {
+                            line.startsWith("TOTAL|") -> total = line.substringAfter('|').toIntOrNull() ?: 0
+                            line.startsWith("PROGRESS|") -> {
+                                val fields = line.split('|', limit = 5)
+                                if (fields.size >= 4) {
+                                    onProgress(fields[1].toIntOrNull() ?: 0, total, fields[3], fields.getOrElse(4) { "" })
+                                }
+                            }
+                        }
+                    }
+                }
+            } catch (_: Exception) {}
+        }
+        val finished = process.waitFor(if (detailed) 300 else 120, TimeUnit.SECONDS)
+        if (!finished) {
+            process.destroy()
+            if (process.isAlive) process.destroyForcibly()
+            reader.join(2000)
+            return ScanResult(null, "扫描超过时间限制（详细模式 300 秒 / 快速模式 120 秒）", System.currentTimeMillis() - started)
+        }
+        reader.join(2000)
+        val output = lines.toList()
+        if (process.exitValue() != 0 || "SCAN_END" !in output) {
+            return ScanResult(null, output.takeLast(35).joinToString("\n"), System.currentTimeMillis() - started)
+        }
+        var zram = "不可用"
+        val swaps = StringBuilder()
+        var inSwaps = false
+        val processes = mutableListOf<ProcessItem>()
+        output.forEach { line ->
+            when {
+                line.startsWith("ZRAM|") -> zram = line.substringAfter('|').ifBlank { "不可用" }
+                line == "SWAPS_BEGIN" -> inSwaps = true
+                line == "SWAPS_END" -> inSwaps = false
+                inSwaps -> if (line.isNotBlank()) swaps.append(line).append("; ")
+                line.startsWith("PROC|") -> {
+                    val f = line.split('|', limit = 8)
+                    if (f.size == 8) processes.add(ProcessItem(
+                        f[1].toIntOrNull() ?: 0, f[2].toIntOrNull() ?: 0, f[3], f[4],
+                        f[5].toLongOrNull() ?: 0, f[6].toLongOrNull() ?: -1, f[7].toLongOrNull() ?: 0
+                    ))
+                }
+            }
+        }
+        val time = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US).format(Date())
+        return ScanResult(Snapshot(time, processes, zram, swaps.toString().ifBlank { "不可用" }), "", System.currentTimeMillis() - started)
+    }
+}
+}name|${'rss|\${'$'}pss|\${'$'}swap"
+              done_count=\${'$'}((done_count+1))
+              if [ "\${'$'}DETAIL" = "1" ]; then stage="详细 PSS"; else stage="基础扫描"; fi
+              echo "PROGRESS|\${'$'}done_count|\${'$'}total|\${'$'}stage|PID \${'$'}pid"
+            done
+            echo "SCAN_END"
+        """.trimIndent()
+
+        val process = try {
+            ProcessBuilder("su", "-c", script).redirectErrorStream(true).start()
+        } catch (e: Exception) {
+            return ScanResult(null, e.toString(), System.currentTimeMillis() - started)
+        }
+        val lines = java.util.Collections.synchronizedList(mutableListOf<String>())
+        var total = 0
+        val reader = thread(name = "pmm-stream-reader") {
+            try {
+                process.inputStream.bufferedReader().useLines { seq ->
+                    seq.forEach { line ->
+                        if (lines.size < 100000) lines.add(line)
+                        when {
+                            line.startsWith("TOTAL|") -> total = line.substringAfter('|').toIntOrNull() ?: 0
+                            line.startsWith("PROGRESS|") -> {
+                                val fields = line.split('|', limit = 5)
+                                if (fields.size >= 4) {
+                                    onProgress(fields[1].toIntOrNull() ?: 0, total, fields[3], fields.getOrElse(4) { "" })
+                                }
+                            }
+                        }
+                    }
+                }
+            } catch (_: Exception) {}
+        }
+        val finished = process.waitFor(if (detailed) 300 else 120, TimeUnit.SECONDS)
+        if (!finished) {
+            process.destroy()
+            if (process.isAlive) process.destroyForcibly()
+            reader.join(2000)
+            return ScanResult(null, "扫描超过时间限制（详细模式 300 秒 / 快速模式 120 秒）", System.currentTimeMillis() - started)
+        }
+        reader.join(2000)
+        val output = lines.toList()
+        if (process.exitValue() != 0 || "SCAN_END" !in output) {
+            return ScanResult(null, output.takeLast(35).joinToString("\n"), System.currentTimeMillis() - started)
+        }
+        var zram = "不可用"
+        val swaps = StringBuilder()
+        var inSwaps = false
+        val processes = mutableListOf<ProcessItem>()
+        output.forEach { line ->
+            when {
+                line.startsWith("ZRAM|") -> zram = line.substringAfter('|').ifBlank { "不可用" }
+                line == "SWAPS_BEGIN" -> inSwaps = true
+                line == "SWAPS_END" -> inSwaps = false
+                inSwaps -> if (line.isNotBlank()) swaps.append(line).append("; ")
+                line.startsWith("PROC|") -> {
+                    val f = line.split('|', limit = 8)
+                    if (f.size == 8) processes.add(ProcessItem(
+                        f[1].toIntOrNull() ?: 0, f[2].toIntOrNull() ?: 0, f[3], f[4],
+                        f[5].toLongOrNull() ?: 0, f[6].toLongOrNull() ?: -1, f[7].toLongOrNull() ?: 0
+                    ))
+                }
+            }
+        }
+        val time = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US).format(Date())
+        return ScanResult(Snapshot(time, processes, zram, swaps.toString().ifBlank { "不可用" }), "", System.currentTimeMillis() - started)
+    }
+}
+}rss|${'pss|\${'$'}swap"
+              done_count=\${'$'}((done_count+1))
+              if [ "\${'$'}DETAIL" = "1" ]; then stage="详细 PSS"; else stage="基础扫描"; fi
+              echo "PROGRESS|\${'$'}done_count|\${'$'}total|\${'$'}stage|PID \${'$'}pid"
+            done
+            echo "SCAN_END"
+        """.trimIndent()
+
+        val process = try {
+            ProcessBuilder("su", "-c", script).redirectErrorStream(true).start()
+        } catch (e: Exception) {
+            return ScanResult(null, e.toString(), System.currentTimeMillis() - started)
+        }
+        val lines = java.util.Collections.synchronizedList(mutableListOf<String>())
+        var total = 0
+        val reader = thread(name = "pmm-stream-reader") {
+            try {
+                process.inputStream.bufferedReader().useLines { seq ->
+                    seq.forEach { line ->
+                        if (lines.size < 100000) lines.add(line)
+                        when {
+                            line.startsWith("TOTAL|") -> total = line.substringAfter('|').toIntOrNull() ?: 0
+                            line.startsWith("PROGRESS|") -> {
+                                val fields = line.split('|', limit = 5)
+                                if (fields.size >= 4) {
+                                    onProgress(fields[1].toIntOrNull() ?: 0, total, fields[3], fields.getOrElse(4) { "" })
+                                }
+                            }
+                        }
+                    }
+                }
+            } catch (_: Exception) {}
+        }
+        val finished = process.waitFor(if (detailed) 300 else 120, TimeUnit.SECONDS)
+        if (!finished) {
+            process.destroy()
+            if (process.isAlive) process.destroyForcibly()
+            reader.join(2000)
+            return ScanResult(null, "扫描超过时间限制（详细模式 300 秒 / 快速模式 120 秒）", System.currentTimeMillis() - started)
+        }
+        reader.join(2000)
+        val output = lines.toList()
+        if (process.exitValue() != 0 || "SCAN_END" !in output) {
+            return ScanResult(null, output.takeLast(35).joinToString("\n"), System.currentTimeMillis() - started)
+        }
+        var zram = "不可用"
+        val swaps = StringBuilder()
+        var inSwaps = false
+        val processes = mutableListOf<ProcessItem>()
+        output.forEach { line ->
+            when {
+                line.startsWith("ZRAM|") -> zram = line.substringAfter('|').ifBlank { "不可用" }
+                line == "SWAPS_BEGIN" -> inSwaps = true
+                line == "SWAPS_END" -> inSwaps = false
+                inSwaps -> if (line.isNotBlank()) swaps.append(line).append("; ")
+                line.startsWith("PROC|") -> {
+                    val f = line.split('|', limit = 8)
+                    if (f.size == 8) processes.add(ProcessItem(
+                        f[1].toIntOrNull() ?: 0, f[2].toIntOrNull() ?: 0, f[3], f[4],
+                        f[5].toLongOrNull() ?: 0, f[6].toLongOrNull() ?: -1, f[7].toLongOrNull() ?: 0
+                    ))
+                }
+            }
+        }
+        val time = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US).format(Date())
+        return ScanResult(Snapshot(time, processes, zram, swaps.toString().ifBlank { "不可用" }), "", System.currentTimeMillis() - started)
+    }
+}
+}pss|${'swap"
+              done_count=\${'$'}((done_count+1))
+              if [ "\${'$'}DETAIL" = "1" ]; then stage="详细 PSS"; else stage="基础扫描"; fi
+              echo "PROGRESS|\${'$'}done_count|\${'$'}total|\${'$'}stage|PID \${'$'}pid"
+            done
+            echo "SCAN_END"
+        """.trimIndent()
+
+        val process = try {
+            ProcessBuilder("su", "-c", script).redirectErrorStream(true).start()
+        } catch (e: Exception) {
+            return ScanResult(null, e.toString(), System.currentTimeMillis() - started)
+        }
+        val lines = java.util.Collections.synchronizedList(mutableListOf<String>())
+        var total = 0
+        val reader = thread(name = "pmm-stream-reader") {
+            try {
+                process.inputStream.bufferedReader().useLines { seq ->
+                    seq.forEach { line ->
+                        if (lines.size < 100000) lines.add(line)
+                        when {
+                            line.startsWith("TOTAL|") -> total = line.substringAfter('|').toIntOrNull() ?: 0
+                            line.startsWith("PROGRESS|") -> {
+                                val fields = line.split('|', limit = 5)
+                                if (fields.size >= 4) {
+                                    onProgress(fields[1].toIntOrNull() ?: 0, total, fields[3], fields.getOrElse(4) { "" })
+                                }
+                            }
+                        }
+                    }
+                }
+            } catch (_: Exception) {}
+        }
+        val finished = process.waitFor(if (detailed) 300 else 120, TimeUnit.SECONDS)
+        if (!finished) {
+            process.destroy()
+            if (process.isAlive) process.destroyForcibly()
+            reader.join(2000)
+            return ScanResult(null, "扫描超过时间限制（详细模式 300 秒 / 快速模式 120 秒）", System.currentTimeMillis() - started)
+        }
+        reader.join(2000)
+        val output = lines.toList()
+        if (process.exitValue() != 0 || "SCAN_END" !in output) {
+            return ScanResult(null, output.takeLast(35).joinToString("\n"), System.currentTimeMillis() - started)
+        }
+        var zram = "不可用"
+        val swaps = StringBuilder()
+        var inSwaps = false
+        val processes = mutableListOf<ProcessItem>()
+        output.forEach { line ->
+            when {
+                line.startsWith("ZRAM|") -> zram = line.substringAfter('|').ifBlank { "不可用" }
+                line == "SWAPS_BEGIN" -> inSwaps = true
+                line == "SWAPS_END" -> inSwaps = false
+                inSwaps -> if (line.isNotBlank()) swaps.append(line).append("; ")
+                line.startsWith("PROC|") -> {
+                    val f = line.split('|', limit = 8)
+                    if (f.size == 8) processes.add(ProcessItem(
+                        f[1].toIntOrNull() ?: 0, f[2].toIntOrNull() ?: 0, f[3], f[4],
+                        f[5].toLongOrNull() ?: 0, f[6].toLongOrNull() ?: -1, f[7].toLongOrNull() ?: 0
+                    ))
+                }
+            }
+        }
+        val time = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US).format(Date())
+        return ScanResult(Snapshot(time, processes, zram, swaps.toString().ifBlank { "不可用" }), "", System.currentTimeMillis() - started)
+    }
+}
+}swap"
+              done_count=${'((done_count+1))
+              if [ "\${'$'}DETAIL" = "1" ]; then stage="详细 PSS"; else stage="基础扫描"; fi
+              echo "PROGRESS|\${'$'}done_count|\${'$'}total|\${'$'}stage|PID \${'$'}pid"
+            done
+            echo "SCAN_END"
+        """.trimIndent()
+
+        val process = try {
+            ProcessBuilder("su", "-c", script).redirectErrorStream(true).start()
+        } catch (e: Exception) {
+            return ScanResult(null, e.toString(), System.currentTimeMillis() - started)
+        }
+        val lines = java.util.Collections.synchronizedList(mutableListOf<String>())
+        var total = 0
+        val reader = thread(name = "pmm-stream-reader") {
+            try {
+                process.inputStream.bufferedReader().useLines { seq ->
+                    seq.forEach { line ->
+                        if (lines.size < 100000) lines.add(line)
+                        when {
+                            line.startsWith("TOTAL|") -> total = line.substringAfter('|').toIntOrNull() ?: 0
+                            line.startsWith("PROGRESS|") -> {
+                                val fields = line.split('|', limit = 5)
+                                if (fields.size >= 4) {
+                                    onProgress(fields[1].toIntOrNull() ?: 0, total, fields[3], fields.getOrElse(4) { "" })
+                                }
+                            }
+                        }
+                    }
+                }
+            } catch (_: Exception) {}
+        }
+        val finished = process.waitFor(if (detailed) 300 else 120, TimeUnit.SECONDS)
+        if (!finished) {
+            process.destroy()
+            if (process.isAlive) process.destroyForcibly()
+            reader.join(2000)
+            return ScanResult(null, "扫描超过时间限制（详细模式 300 秒 / 快速模式 120 秒）", System.currentTimeMillis() - started)
+        }
+        reader.join(2000)
+        val output = lines.toList()
+        if (process.exitValue() != 0 || "SCAN_END" !in output) {
+            return ScanResult(null, output.takeLast(35).joinToString("\n"), System.currentTimeMillis() - started)
+        }
+        var zram = "不可用"
+        val swaps = StringBuilder()
+        var inSwaps = false
+        val processes = mutableListOf<ProcessItem>()
+        output.forEach { line ->
+            when {
+                line.startsWith("ZRAM|") -> zram = line.substringAfter('|').ifBlank { "不可用" }
+                line == "SWAPS_BEGIN" -> inSwaps = true
+                line == "SWAPS_END" -> inSwaps = false
+                inSwaps -> if (line.isNotBlank()) swaps.append(line).append("; ")
+                line.startsWith("PROC|") -> {
+                    val f = line.split('|', limit = 8)
+                    if (f.size == 8) processes.add(ProcessItem(
+                        f[1].toIntOrNull() ?: 0, f[2].toIntOrNull() ?: 0, f[3], f[4],
+                        f[5].toLongOrNull() ?: 0, f[6].toLongOrNull() ?: -1, f[7].toLongOrNull() ?: 0
+                    ))
+                }
+            }
+        }
+        val time = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US).format(Date())
+        return ScanResult(Snapshot(time, processes, zram, swaps.toString().ifBlank { "不可用" }), "", System.currentTimeMillis() - started)
+    }
+}
+}((done_count+1))
+              if [ "${'DETAIL" = "1" ]; then stage="详细 PSS"; else stage="基础扫描"; fi
+              echo "PROGRESS|\${'$'}done_count|\${'$'}total|\${'$'}stage|PID \${'$'}pid"
+            done
+            echo "SCAN_END"
+        """.trimIndent()
+
+        val process = try {
+            ProcessBuilder("su", "-c", script).redirectErrorStream(true).start()
+        } catch (e: Exception) {
+            return ScanResult(null, e.toString(), System.currentTimeMillis() - started)
+        }
+        val lines = java.util.Collections.synchronizedList(mutableListOf<String>())
+        var total = 0
+        val reader = thread(name = "pmm-stream-reader") {
+            try {
+                process.inputStream.bufferedReader().useLines { seq ->
+                    seq.forEach { line ->
+                        if (lines.size < 100000) lines.add(line)
+                        when {
+                            line.startsWith("TOTAL|") -> total = line.substringAfter('|').toIntOrNull() ?: 0
+                            line.startsWith("PROGRESS|") -> {
+                                val fields = line.split('|', limit = 5)
+                                if (fields.size >= 4) {
+                                    onProgress(fields[1].toIntOrNull() ?: 0, total, fields[3], fields.getOrElse(4) { "" })
+                                }
+                            }
+                        }
+                    }
+                }
+            } catch (_: Exception) {}
+        }
+        val finished = process.waitFor(if (detailed) 300 else 120, TimeUnit.SECONDS)
+        if (!finished) {
+            process.destroy()
+            if (process.isAlive) process.destroyForcibly()
+            reader.join(2000)
+            return ScanResult(null, "扫描超过时间限制（详细模式 300 秒 / 快速模式 120 秒）", System.currentTimeMillis() - started)
+        }
+        reader.join(2000)
+        val output = lines.toList()
+        if (process.exitValue() != 0 || "SCAN_END" !in output) {
+            return ScanResult(null, output.takeLast(35).joinToString("\n"), System.currentTimeMillis() - started)
+        }
+        var zram = "不可用"
+        val swaps = StringBuilder()
+        var inSwaps = false
+        val processes = mutableListOf<ProcessItem>()
+        output.forEach { line ->
+            when {
+                line.startsWith("ZRAM|") -> zram = line.substringAfter('|').ifBlank { "不可用" }
+                line == "SWAPS_BEGIN" -> inSwaps = true
+                line == "SWAPS_END" -> inSwaps = false
+                inSwaps -> if (line.isNotBlank()) swaps.append(line).append("; ")
+                line.startsWith("PROC|") -> {
+                    val f = line.split('|', limit = 8)
+                    if (f.size == 8) processes.add(ProcessItem(
+                        f[1].toIntOrNull() ?: 0, f[2].toIntOrNull() ?: 0, f[3], f[4],
+                        f[5].toLongOrNull() ?: 0, f[6].toLongOrNull() ?: -1, f[7].toLongOrNull() ?: 0
+                    ))
+                }
+            }
+        }
+        val time = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US).format(Date())
+        return ScanResult(Snapshot(time, processes, zram, swaps.toString().ifBlank { "不可用" }), "", System.currentTimeMillis() - started)
+    }
+}
+}DETAIL" = "1" ]; then stage="详细 PSS"; else stage="基础扫描"; fi
+              echo "PROGRESS|${'done_count|\${'$'}total|\${'$'}stage|PID \${'$'}pid"
+            done
+            echo "SCAN_END"
+        """.trimIndent()
+
+        val process = try {
+            ProcessBuilder("su", "-c", script).redirectErrorStream(true).start()
+        } catch (e: Exception) {
+            return ScanResult(null, e.toString(), System.currentTimeMillis() - started)
+        }
+        val lines = java.util.Collections.synchronizedList(mutableListOf<String>())
+        var total = 0
+        val reader = thread(name = "pmm-stream-reader") {
+            try {
+                process.inputStream.bufferedReader().useLines { seq ->
+                    seq.forEach { line ->
+                        if (lines.size < 100000) lines.add(line)
+                        when {
+                            line.startsWith("TOTAL|") -> total = line.substringAfter('|').toIntOrNull() ?: 0
+                            line.startsWith("PROGRESS|") -> {
+                                val fields = line.split('|', limit = 5)
+                                if (fields.size >= 4) {
+                                    onProgress(fields[1].toIntOrNull() ?: 0, total, fields[3], fields.getOrElse(4) { "" })
+                                }
+                            }
+                        }
+                    }
+                }
+            } catch (_: Exception) {}
+        }
+        val finished = process.waitFor(if (detailed) 300 else 120, TimeUnit.SECONDS)
+        if (!finished) {
+            process.destroy()
+            if (process.isAlive) process.destroyForcibly()
+            reader.join(2000)
+            return ScanResult(null, "扫描超过时间限制（详细模式 300 秒 / 快速模式 120 秒）", System.currentTimeMillis() - started)
+        }
+        reader.join(2000)
+        val output = lines.toList()
+        if (process.exitValue() != 0 || "SCAN_END" !in output) {
+            return ScanResult(null, output.takeLast(35).joinToString("\n"), System.currentTimeMillis() - started)
+        }
+        var zram = "不可用"
+        val swaps = StringBuilder()
+        var inSwaps = false
+        val processes = mutableListOf<ProcessItem>()
+        output.forEach { line ->
+            when {
+                line.startsWith("ZRAM|") -> zram = line.substringAfter('|').ifBlank { "不可用" }
+                line == "SWAPS_BEGIN" -> inSwaps = true
+                line == "SWAPS_END" -> inSwaps = false
+                inSwaps -> if (line.isNotBlank()) swaps.append(line).append("; ")
+                line.startsWith("PROC|") -> {
+                    val f = line.split('|', limit = 8)
+                    if (f.size == 8) processes.add(ProcessItem(
+                        f[1].toIntOrNull() ?: 0, f[2].toIntOrNull() ?: 0, f[3], f[4],
+                        f[5].toLongOrNull() ?: 0, f[6].toLongOrNull() ?: -1, f[7].toLongOrNull() ?: 0
+                    ))
+                }
+            }
+        }
+        val time = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US).format(Date())
+        return ScanResult(Snapshot(time, processes, zram, swaps.toString().ifBlank { "不可用" }), "", System.currentTimeMillis() - started)
+    }
+}
+}done_count|${'total|\${'$'}stage|PID \${'$'}pid"
+            done
+            echo "SCAN_END"
+        """.trimIndent()
+
+        val process = try {
+            ProcessBuilder("su", "-c", script).redirectErrorStream(true).start()
+        } catch (e: Exception) {
+            return ScanResult(null, e.toString(), System.currentTimeMillis() - started)
+        }
+        val lines = java.util.Collections.synchronizedList(mutableListOf<String>())
+        var total = 0
+        val reader = thread(name = "pmm-stream-reader") {
+            try {
+                process.inputStream.bufferedReader().useLines { seq ->
+                    seq.forEach { line ->
+                        if (lines.size < 100000) lines.add(line)
+                        when {
+                            line.startsWith("TOTAL|") -> total = line.substringAfter('|').toIntOrNull() ?: 0
+                            line.startsWith("PROGRESS|") -> {
+                                val fields = line.split('|', limit = 5)
+                                if (fields.size >= 4) {
+                                    onProgress(fields[1].toIntOrNull() ?: 0, total, fields[3], fields.getOrElse(4) { "" })
+                                }
+                            }
+                        }
+                    }
+                }
+            } catch (_: Exception) {}
+        }
+        val finished = process.waitFor(if (detailed) 300 else 120, TimeUnit.SECONDS)
+        if (!finished) {
+            process.destroy()
+            if (process.isAlive) process.destroyForcibly()
+            reader.join(2000)
+            return ScanResult(null, "扫描超过时间限制（详细模式 300 秒 / 快速模式 120 秒）", System.currentTimeMillis() - started)
+        }
+        reader.join(2000)
+        val output = lines.toList()
+        if (process.exitValue() != 0 || "SCAN_END" !in output) {
+            return ScanResult(null, output.takeLast(35).joinToString("\n"), System.currentTimeMillis() - started)
+        }
+        var zram = "不可用"
+        val swaps = StringBuilder()
+        var inSwaps = false
+        val processes = mutableListOf<ProcessItem>()
+        output.forEach { line ->
+            when {
+                line.startsWith("ZRAM|") -> zram = line.substringAfter('|').ifBlank { "不可用" }
+                line == "SWAPS_BEGIN" -> inSwaps = true
+                line == "SWAPS_END" -> inSwaps = false
+                inSwaps -> if (line.isNotBlank()) swaps.append(line).append("; ")
+                line.startsWith("PROC|") -> {
+                    val f = line.split('|', limit = 8)
+                    if (f.size == 8) processes.add(ProcessItem(
+                        f[1].toIntOrNull() ?: 0, f[2].toIntOrNull() ?: 0, f[3], f[4],
+                        f[5].toLongOrNull() ?: 0, f[6].toLongOrNull() ?: -1, f[7].toLongOrNull() ?: 0
+                    ))
+                }
+            }
+        }
+        val time = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US).format(Date())
+        return ScanResult(Snapshot(time, processes, zram, swaps.toString().ifBlank { "不可用" }), "", System.currentTimeMillis() - started)
+    }
+}
+}total|${'stage|PID \${'$'}pid"
+            done
+            echo "SCAN_END"
+        """.trimIndent()
+
+        val process = try {
+            ProcessBuilder("su", "-c", script).redirectErrorStream(true).start()
+        } catch (e: Exception) {
+            return ScanResult(null, e.toString(), System.currentTimeMillis() - started)
+        }
+        val lines = java.util.Collections.synchronizedList(mutableListOf<String>())
+        var total = 0
+        val reader = thread(name = "pmm-stream-reader") {
+            try {
+                process.inputStream.bufferedReader().useLines { seq ->
+                    seq.forEach { line ->
+                        if (lines.size < 100000) lines.add(line)
+                        when {
+                            line.startsWith("TOTAL|") -> total = line.substringAfter('|').toIntOrNull() ?: 0
+                            line.startsWith("PROGRESS|") -> {
+                                val fields = line.split('|', limit = 5)
+                                if (fields.size >= 4) {
+                                    onProgress(fields[1].toIntOrNull() ?: 0, total, fields[3], fields.getOrElse(4) { "" })
+                                }
+                            }
+                        }
+                    }
+                }
+            } catch (_: Exception) {}
+        }
+        val finished = process.waitFor(if (detailed) 300 else 120, TimeUnit.SECONDS)
+        if (!finished) {
+            process.destroy()
+            if (process.isAlive) process.destroyForcibly()
+            reader.join(2000)
+            return ScanResult(null, "扫描超过时间限制（详细模式 300 秒 / 快速模式 120 秒）", System.currentTimeMillis() - started)
+        }
+        reader.join(2000)
+        val output = lines.toList()
+        if (process.exitValue() != 0 || "SCAN_END" !in output) {
+            return ScanResult(null, output.takeLast(35).joinToString("\n"), System.currentTimeMillis() - started)
+        }
+        var zram = "不可用"
+        val swaps = StringBuilder()
+        var inSwaps = false
+        val processes = mutableListOf<ProcessItem>()
+        output.forEach { line ->
+            when {
+                line.startsWith("ZRAM|") -> zram = line.substringAfter('|').ifBlank { "不可用" }
+                line == "SWAPS_BEGIN" -> inSwaps = true
+                line == "SWAPS_END" -> inSwaps = false
+                inSwaps -> if (line.isNotBlank()) swaps.append(line).append("; ")
+                line.startsWith("PROC|") -> {
+                    val f = line.split('|', limit = 8)
+                    if (f.size == 8) processes.add(ProcessItem(
+                        f[1].toIntOrNull() ?: 0, f[2].toIntOrNull() ?: 0, f[3], f[4],
+                        f[5].toLongOrNull() ?: 0, f[6].toLongOrNull() ?: -1, f[7].toLongOrNull() ?: 0
+                    ))
+                }
+            }
+        }
+        val time = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US).format(Date())
+        return ScanResult(Snapshot(time, processes, zram, swaps.toString().ifBlank { "不可用" }), "", System.currentTimeMillis() - started)
+    }
+}
+}stage|PID ${'pid"
+            done
+            echo "SCAN_END"
+        """.trimIndent()
+
+        val process = try {
+            ProcessBuilder("su", "-c", script).redirectErrorStream(true).start()
+        } catch (e: Exception) {
+            return ScanResult(null, e.toString(), System.currentTimeMillis() - started)
+        }
+        val lines = java.util.Collections.synchronizedList(mutableListOf<String>())
+        var total = 0
+        val reader = thread(name = "pmm-stream-reader") {
+            try {
+                process.inputStream.bufferedReader().useLines { seq ->
+                    seq.forEach { line ->
+                        if (lines.size < 100000) lines.add(line)
+                        when {
+                            line.startsWith("TOTAL|") -> total = line.substringAfter('|').toIntOrNull() ?: 0
+                            line.startsWith("PROGRESS|") -> {
+                                val fields = line.split('|', limit = 5)
+                                if (fields.size >= 4) {
+                                    onProgress(fields[1].toIntOrNull() ?: 0, total, fields[3], fields.getOrElse(4) { "" })
+                                }
+                            }
+                        }
+                    }
+                }
+            } catch (_: Exception) {}
+        }
+        val finished = process.waitFor(if (detailed) 300 else 120, TimeUnit.SECONDS)
+        if (!finished) {
+            process.destroy()
+            if (process.isAlive) process.destroyForcibly()
+            reader.join(2000)
+            return ScanResult(null, "扫描超过时间限制（详细模式 300 秒 / 快速模式 120 秒）", System.currentTimeMillis() - started)
+        }
+        reader.join(2000)
+        val output = lines.toList()
+        if (process.exitValue() != 0 || "SCAN_END" !in output) {
+            return ScanResult(null, output.takeLast(35).joinToString("\n"), System.currentTimeMillis() - started)
+        }
+        var zram = "不可用"
+        val swaps = StringBuilder()
+        var inSwaps = false
+        val processes = mutableListOf<ProcessItem>()
+        output.forEach { line ->
+            when {
+                line.startsWith("ZRAM|") -> zram = line.substringAfter('|').ifBlank { "不可用" }
+                line == "SWAPS_BEGIN" -> inSwaps = true
+                line == "SWAPS_END" -> inSwaps = false
+                inSwaps -> if (line.isNotBlank()) swaps.append(line).append("; ")
+                line.startsWith("PROC|") -> {
+                    val f = line.split('|', limit = 8)
+                    if (f.size == 8) processes.add(ProcessItem(
+                        f[1].toIntOrNull() ?: 0, f[2].toIntOrNull() ?: 0, f[3], f[4],
+                        f[5].toLongOrNull() ?: 0, f[6].toLongOrNull() ?: -1, f[7].toLongOrNull() ?: 0
+                    ))
+                }
+            }
+        }
+        val time = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US).format(Date())
+        return ScanResult(Snapshot(time, processes, zram, swaps.toString().ifBlank { "不可用" }), "", System.currentTimeMillis() - started)
+    }
+}
+}pid"
             done
             echo "SCAN_END"
         """.trimIndent()
