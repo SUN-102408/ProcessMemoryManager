@@ -57,7 +57,7 @@ class MainActivity : Activity() {
             setBackgroundColor(BG)
         }
         page.addView(text("PMM", 28, true, WHITE))
-        page.addView(text("PROCESS MEMORY MANAGER  ·  0.3.0-alpha2", 10, true, BLUE))
+        page.addView(text("PROCESS MEMORY MANAGER  ·  0.3.0-alpha3", 10, true, BLUE))
         val scroll = ScrollView(this)
         val content = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         scroll.addView(content)
@@ -123,6 +123,33 @@ class MainActivity : Activity() {
             }
             adapter = ProcessAdapter()
             recycler.adapter = adapter
+
+            val controls = LinearLayout(this@MainActivity).apply {
+                orientation = LinearLayout.HORIZONTAL
+            }
+            val sortSpinner = Spinner(this@MainActivity).apply {
+                adapter = ArrayAdapter(this@MainActivity, android.R.layout.simple_spinner_dropdown_item,
+                    listOf("按 RSS 排序", "按 PSS 排序", "按 Swap 排序"))
+                onItemSelectedListener = object : android.widget.AdapterView.OnItemSelectedListener {
+                    override fun onNothingSelected(parent: android.widget.AdapterView<*>?) {}
+                    override fun onItemSelected(parent: android.widget.AdapterView<*>?, view: View?, position: Int, id: Long) {
+                        this@MainActivity.adapter.setSort(position)
+                    }
+                }
+            }
+            val uidSpinner = Spinner(this@MainActivity).apply {
+                adapter = ArrayAdapter(this@MainActivity, android.R.layout.simple_spinner_dropdown_item,
+                    listOf("全部进程", "应用 UID（≥10000）", "系统 UID（<10000）"))
+                onItemSelectedListener = object : android.widget.AdapterView.OnItemSelectedListener {
+                    override fun onNothingSelected(parent: android.widget.AdapterView<*>?) {}
+                    override fun onItemSelected(parent: android.widget.AdapterView<*>?, view: View?, position: Int, id: Long) {
+                        this@MainActivity.adapter.setUidFilter(position)
+                    }
+                }
+            }
+            controls.addView(sortSpinner, LinearLayout.LayoutParams(0, dp(48), 1f))
+            controls.addView(uidSpinner, LinearLayout.LayoutParams(0, dp(48), 1f))
+            addView(controls)
             addView(text("提示：在下方列表区域内上下滑动，可独立浏览全部进程。", 10, false, MUTED))
             addView(recycler, LinearLayout.LayoutParams(-1, dp(560)))
             search.addTextChangedListener(object : android.text.TextWatcher {
@@ -222,8 +249,11 @@ class MainActivity : Activity() {
                     lastStatus = "扫描完成"
                     val s = result.data
                     val pss = if (detailedMode) formatKb(s.processes.filter { it.pssKb >= 0 }.sumOf { it.pssKb }) else "快速模式未采集"
+                    val privateDirty = if (detailedMode) formatKb(s.processes.filter { it.privateDirtyKb >= 0 }.sumOf { it.privateDirtyKb }) else "未采集"
+                    val sharedDirty = if (detailedMode) formatKb(s.processes.filter { it.sharedDirtyKb >= 0 }.sumOf { it.sharedDirtyKb }) else "未采集"
                     summary.text = "时间：" + s.time + "\n耗时：" + result.duration + " ms\n进程数：" + s.processes.size +
-                        "\nPSS 合计：" + pss + "\nRSS 合计：" + formatKb(s.processes.sumOf { it.rssKb }) +
+                        "\nPSS 合计：" + pss + "\nPrivate Dirty 合计：" + privateDirty +
+                        "\nShared Dirty 合计：" + sharedDirty + "\nRSS 合计：" + formatKb(s.processes.sumOf { it.rssKb }) +
                         "\n进程 Swap 合计：" + formatKb(s.processes.sumOf { it.swapKb }) +
                         "\nZRAM（全局）：" + formatZram(s.zram) + "\nSwap 设备：" + s.swaps
                     adapter.submit(s.processes)
@@ -235,7 +265,7 @@ class MainActivity : Activity() {
     }
 
     private fun makeReport(): String = buildString {
-        append("Process Memory Manager 诊断报告\n版本：0.3.0-alpha2\n")
+        append("Process Memory Manager 诊断报告\n版本：0.3.0-alpha3\n")
         append("设备：" + Build.MANUFACTURER + " " + Build.MODEL + " / Android " + Build.VERSION.RELEASE + "\n")
         append("生成时间：" + now() + "\n状态：" + lastStatus + "\n耗时：" + lastDuration + " ms\n\n")
         if (lastError.isNotBlank()) append("[错误]\n" + lastError + "\n\n")
@@ -245,7 +275,10 @@ class MainActivity : Activity() {
             append("[进程列表]\n")
             s.processes.forEach {
                 append(it.name + "\tPID=" + it.pid + "\tUID=" + it.uid + "\tRSS=" + it.rssKb + "KB\tPSS=" +
-                    (if (it.pssKb >= 0) it.pssKb.toString() else "未采集") + "\tSwap=" + it.swapKb + "KB\n")
+                    (if (it.pssKb >= 0) it.pssKb.toString() else "未采集") +
+                    "KB\tPrivateDirty=" + (if (it.privateDirtyKb >= 0) it.privateDirtyKb.toString() else "未采集") +
+                    "KB\tSharedDirty=" + (if (it.sharedDirtyKb >= 0) it.sharedDirtyKb.toString() else "未采集") +
+                    "KB\tSwap=" + it.swapKb + "KB\n")
             }
         }
         if (includeLog.isChecked) append("\n[运行摘要]\n" + lastStatus + "；最近扫描耗时 " + lastDuration + " ms\n")
@@ -261,7 +294,7 @@ class MainActivity : Activity() {
     private fun shareReport() {
         val send = Intent(Intent.ACTION_SEND).apply {
             type = "text/plain"
-            putExtra(Intent.EXTRA_SUBJECT, "PMM 0.3.0-alpha2 诊断报告")
+            putExtra(Intent.EXTRA_SUBJECT, "PMM 0.3.0-alpha3 诊断报告")
             putExtra(Intent.EXTRA_TEXT, makeReport())
         }
         startActivity(Intent.createChooser(send, "分享纯文字报告"))
@@ -322,13 +355,43 @@ class MainActivity : Activity() {
     private inner class ProcessAdapter : RecyclerView.Adapter<ProcessAdapter.Holder>() {
         private var all: List<ProcessItem> = emptyList()
         private var visible: List<ProcessItem> = emptyList()
+        private var queryText = ""
+        private var sortMode = 0
+        private var uidFilter = 0
         inner class Holder(val container: LinearLayout) : RecyclerView.ViewHolder(container)
         fun submit(items: List<ProcessItem>) {
-            all = items.sortedByDescending { if (it.pssKb >= 0) it.pssKb else it.rssKb }
-            filter("")
+            all = items
+            applyFilters()
         }
         fun filter(query: String) {
-            visible = all.filter { it.name.contains(query, true) || it.pid.toString().contains(query) || it.uid.toString().contains(query) }
+            queryText = query
+            applyFilters()
+        }
+        fun setSort(mode: Int) {
+            sortMode = mode
+            applyFilters()
+        }
+        fun setUidFilter(mode: Int) {
+            uidFilter = mode
+            applyFilters()
+        }
+        private fun applyFilters() {
+            val filtered = all.filter { p ->
+                val matchesQuery = p.name.contains(queryText, true) ||
+                    p.pid.toString().contains(queryText) || p.uid.toString().contains(queryText)
+                val appId = p.uid % 100000
+                val matchesUid = when (uidFilter) {
+                    1 -> appId >= 10000
+                    2 -> appId < 10000
+                    else -> true
+                }
+                matchesQuery && matchesUid
+            }
+            visible = when (sortMode) {
+                1 -> filtered.sortedByDescending { if (it.pssKb >= 0) it.pssKb else it.rssKb }
+                2 -> filtered.sortedByDescending { it.swapKb }
+                else -> filtered.sortedByDescending { it.rssKb }
+            }
             notifyDataSetChanged()
         }
         override fun onCreateViewHolder(parent: ViewGroup, viewType: Int): Holder {
@@ -346,6 +409,11 @@ class MainActivity : Activity() {
             holder.container.addView(text("UID " + p.uid + "  |  RSS " + formatKb(p.rssKb) +
                 "  |  PSS " + (if (p.pssKb >= 0) formatKb(p.pssKb) else "未采集") +
                 "  |  Swap " + formatKb(p.swapKb), 11, false, MUTED))
+            holder.container.addView(text(
+                "Private Dirty " + (if (p.privateDirtyKb >= 0) formatKb(p.privateDirtyKb) else "未采集") +
+                    "  |  Shared Dirty " + (if (p.sharedDirtyKb >= 0) formatKb(p.sharedDirtyKb) else "未采集"),
+                10, false, MUTED
+            ))
         }
         override fun getItemCount() = visible.size
     }
@@ -356,7 +424,7 @@ class MainActivity : Activity() {
     }
 }
 
-private data class ProcessItem(val pid: Int, val uid: Int, val startTicks: String, val name: String, val rssKb: Long, val pssKb: Long, val swapKb: Long)
+private data class ProcessItem(val pid: Int, val uid: Int, val startTicks: String, val name: String, val rssKb: Long, val pssKb: Long, val privateDirtyKb: Long, val sharedDirtyKb: Long, val swapKb: Long)
 private data class Snapshot(val time: String, val processes: List<ProcessItem>, val zram: String, val swaps: String)
 private data class ScanResult(val data: Snapshot?, val error: String, val duration: Long)
 private data class CommandResult(val code: Int, val output: String)
@@ -410,12 +478,16 @@ private object Root {
                 echo "PROGRESS|@D@done_count|@D@total|读取进程|PID @D@pid"
                 continue
               fi
-              vals=@D@(awk '/^Uid:/{u=@D@2} /^VmRSS:/{r=@D@2} /^VmSwap:/{s=@D@2} /^Name:/{n=@D@2} END{printf "%s|%s|%s|%s",u,r,s,n}' "@D@status" 2>/dev/null)
+              vals=@D@(awk '/^Uid:/{u=@D@2} /^VmRSS:/{r=@D@2} /^VmSwap:/{s=@D@2} END{printf "%s|%s|%s",u,r,s}' "@D@status" 2>/dev/null)
               oldifs=@D@IFS
               IFS='|'
               set -- @D@vals
               IFS=@D@oldifs
-              uid=@D@{1:-0}; rss=@D@{2:-0}; vswap=@D@{3:-0}; name=@D@{4:-unknown}
+              uid=@D@{1:-0}; rss=@D@{2:-0}; vswap=@D@{3:-0}
+              fallback=@D@(awk '/^Name:/{sub(/^Name:[ \\t]*/, ""); print; exit}' "@D@status" 2>/dev/null)
+              name=@D@(tr '\\000' '\\n' < "@D@x/cmdline" 2>/dev/null | head -n 1)
+              [ -n "@D@name" ] || name=@D@fallback
+              [ -n "@D@name" ] || name=unknown
               case "@D@uid" in ''|*[!0-9]*) uid=0;; esac
               case "@D@rss" in ''|*[!0-9]*) rss=0;; esac
               case "@D@vswap" in ''|*[!0-9]*) vswap=0;; esac
@@ -428,14 +500,16 @@ private object Root {
               startticks=@D@(printf '%s\n' "@D@statline" | awk '{sub(/^.*\) /,""); print @D@20}')
               [ -n "@D@startticks" ] || startticks=0
               pss=-1
+              private_dirty=-1
+              shared_dirty=-1
               swap=@D@vswap
               if [ "@D@DETAIL" = "1" ] && [ -r "@D@x/smaps" ]; then
-                mem=@D@(awk '/^Pss:/{p+=@D@2} /^Swap:/{s+=@D@2} END{printf "%d|%d",p,s}' "@D@x/smaps" 2>/dev/null)
+                mem=@D@(awk '/^Pss:/{p+=@D@2} /^Private_Dirty:/{pd+=@D@2} /^Shared_Dirty:/{sd+=@D@2} /^Swap:/{s+=@D@2} END{printf "%d|%d|%d|%d",p,pd,sd,s}' "@D@x/smaps" 2>/dev/null)
                 oldifs=@D@IFS; IFS='|'; set -- @D@mem; IFS=@D@oldifs
-                pss=@D@{1:--1}; swap=@D@{2:-@D@vswap}
+                pss=@D@{1:--1}; private_dirty=@D@{2:--1}; shared_dirty=@D@{3:--1}; swap=@D@{4:-@D@vswap}
               fi
               name=@D@(printf '%s' "@D@name" | tr '|' '_')
-              echo "PROC|@D@pid|@D@uid|@D@startticks|@D@name|@D@rss|@D@pss|@D@swap"
+              echo "PROC|@D@pid|@D@uid|@D@startticks|@D@name|@D@rss|@D@pss|@D@private_dirty|@D@shared_dirty|@D@swap"
               done_count=@D@((done_count+1))
               if [ "@D@DETAIL" = "1" ]; then stage="详细 PSS"; else stage="基础扫描"; fi
               echo "PROGRESS|@D@done_count|@D@total|@D@stage|PID @D@pid"
@@ -494,10 +568,12 @@ private object Root {
                 line == "SWAPS_END" -> inSwaps = false
                 inSwaps -> if (line.isNotBlank()) swaps.append(line).append("; ")
                 line.startsWith("PROC|") -> {
-                    val f = line.split('|', limit = 8)
-                    if (f.size == 8) processes.add(ProcessItem(
+                    val f = line.split('|', limit = 10)
+                    if (f.size == 10) processes.add(ProcessItem(
                         f[1].toIntOrNull() ?: 0, f[2].toIntOrNull() ?: 0, f[3], f[4],
-                        f[5].toLongOrNull() ?: 0, f[6].toLongOrNull() ?: -1, f[7].toLongOrNull() ?: 0
+                        f[5].toLongOrNull() ?: 0, f[6].toLongOrNull() ?: -1,
+                        f[7].toLongOrNull() ?: -1, f[8].toLongOrNull() ?: -1,
+                        f[9].toLongOrNull() ?: 0
                     ))
                 }
             }
