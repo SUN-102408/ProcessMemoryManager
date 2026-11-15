@@ -1,16 +1,15 @@
 # Process Memory Manager (PMM)
 
-Version: 0.3.0-alpha1 — redesigned read-only Android process diagnostics.
+Version: 0.3.0-alpha2
 
-## Included
-- Dark dashboard and adaptive launcher icon.
-- RecyclerView process list with name/PID/UID filtering.
-- Streaming progress by processed PID count and current stage.
-- Quick scan plus optional detailed PSS via /proc/PID/smaps.
-- Copy/share diagnostic reports as plain text, without FileProvider attachments.
-- Root access is requested only after the user taps the Root check button.
+## Changes
+- Fix process-list scrolling inside the dashboard; allow the RecyclerView to own touch gestures.
+- Fix process-name sanitization (the previous tr character set accidentally replaced ordinary letters).
+- Decode global ZRAM mm_stat into original/compressed/physical-used sizes and ratio.
+- Add a guarded process-reclaim capability panel with kernel-version diagnostics.
+- Keep copy/share reports as plain text.
 
-## Safety
-This alpha remains read-only. It does not kill, freeze, force-stop, or reclaim processes and does not write to /proc, /sys, cgroups, swap, or system properties.
+## Reclaim capability and safety
+The app does not pretend that global ZRAM activity is per-process compression. A real process-specific page-out path requires kernel support such as process_madvise() and MADV_PAGEOUT, plus runtime validation. These interfaces are not part of upstream Linux 4.4. On older kernels, the app reports the limitation and does not run drop_caches, memory.force_empty, process freezing, process killing, or global swap changes as a substitute.
 
-Progress is a processed-entry count, not an ETA. ZRAM figures are global kernel statistics and are not attributed to individual processes.
+No process reclaim is executed by this alpha build. It remains a diagnostic/capability-check release.
