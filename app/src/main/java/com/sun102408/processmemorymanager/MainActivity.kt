@@ -484,8 +484,8 @@ private object Root {
               set -- @D@vals
               IFS=@D@oldifs
               uid=@D@{1:-0}; rss=@D@{2:-0}; vswap=@D@{3:-0}
-              fallback=@D@(awk '/^Name:/{sub(/^Name:[ \\t]*/, ""); print; exit}' "@D@status" 2>/dev/null)
-              name=@D@(tr '\\000' '\\n' < "@D@x/cmdline" 2>/dev/null | head -n 1)
+              fallback=@D@(awk '/^Name:/{sub(/^Name:[ \t]*/, ""); print; exit}' "@D@status" 2>/dev/null)
+              name=@D@(tr '\000' '\n' < "@D@x/cmdline" 2>/dev/null | head -n 1)
               [ -n "@D@name" ] || name=@D@fallback
               [ -n "@D@name" ] || name=unknown
               case "@D@uid" in ''|*[!0-9]*) uid=0;; esac
