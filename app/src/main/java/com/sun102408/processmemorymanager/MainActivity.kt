@@ -205,7 +205,7 @@ class MainActivity : Activity() {
         if (snapshot == null) { AlertDialog.Builder(this).setMessage("请先扫描进程。").setPositiveButton("知道了", null).show(); return }
         val items = snapshot.processes.sortedByDescending { if (it.pssKb > 0) it.pssKb else it.rssKb }.take(500)
         val container = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(dp(18), dp(8), dp(18), 0) }
-        val search = EditText(this).apply { hint = "搜索进程名 / PID / UID"; singleLine = true }
+        val search = EditText(this).apply { hint = "搜索进程名 / PID / UID"; setSingleLine(true) }
         val count = TextView(this).apply { textSize = 12f; setTextColor(0xFF64748B.toInt()); setPadding(0, dp(4), 0, dp(6)) }
         val rows = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         val listScroll = ScrollView(this).apply { addView(rows); layoutParams = LinearLayout.LayoutParams(-1, dp(390)) }
@@ -258,7 +258,7 @@ class MainActivity : Activity() {
             runOnUiThread {
                 capabilityButton.isEnabled = true
                 status.text = "内核能力检测完成。注意：发现接口不等于已证明可以安全地回收指定进程。\n${report.summary}"
-                log("CAPABILITY_PROBE", report.summary.replace('\n', '; '))
+                log("CAPABILITY_PROBE", report.summary.replace("\n", "; "))
                 refreshLog()
             }
         }
