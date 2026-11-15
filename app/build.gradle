@@ -7,64 +7,11 @@ android {
     namespace 'com.sun102408.processmemorymanager'
     compileSdk 35
 
-    // 统一 Java 编译目标为 JDK 17
     compileOptions {
         sourceCompatibility JavaVersion.VERSION_17
         targetCompatibility JavaVersion.VERSION_17
     }
 
-    // 统一 Kotlin 编译目标为 JVM 17
-    kotlinOptions {
-        jvmTarget = '17'
-    }
-
-    defaultConfig {
-        applicationId 'com.sun102408.processmemorymanager'
-        minSdk 26
-        targetSdk 29
-        versionCode 1
-        versionName '0.1.0-alpha1'
-    }
-}plugins {
-    id 'com.android.application'
-    id 'org.jetbrains.kotlin.android'
-}
-
-android {
-    namespace 'com.sun102408.processmemorymanager'
-    compileSdk 35
-
-    defaultConfig {
-        applicationId 'com.sun102408.processmemorymanager'
-        minSdk 26
-        targetSdk 29
-        versionCode 1
-        versionName '0.1.0-alpha1'
-    }
-}
-
-
-
-
-
-
-
-plugins {
-    id 'com.android.application'
-    id 'org.jetbrains.kotlin.android'
-}
-
-android {
-    namespace 'com.sun102408.processmemorymanager'
-    compileSdk 35
-
-    // 统一 Java 编译目标为 JDK 17
-    compileOptions {
-        sourceCompatibility JavaVersion.VERSION_17
-        targetCompatibility JavaVersion.VERSION_17
-    }
-
-    // 统一 Kotlin 编译目标为 JVM 17
     kotlinOptions {
         jvmTarget = '17'
     }
@@ -77,4 +24,3 @@ android {
         versionName '0.1.0-alpha1'
     }
 }
-
