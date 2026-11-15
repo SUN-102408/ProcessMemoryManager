@@ -329,57 +329,60 @@ private object Root {
         val detailFlag = if (detailed) "1" else "0"
         val systemFlag = if (includeSystem) "1" else "0"
         val script = """
-            DETAIL=$detailFlag
-            INCLUDE_SYSTEM=$systemFlag
+            DETAIL=@DETAIL@
+            INCLUDE_SYSTEM=@SYSTEM@
             total=0
-            for x in /proc/[0-9]*; do [ -d "${'$'}x" ] && total=${'$'}((total+1)); done
-            echo "TOTAL|${'$'}total"
-            echo "ZRAM|${'$'}(cat /sys/block/zram0/mm_stat 2>/dev/null)"
+            for x in /proc/[0-9]*; do [ -d "@D@x" ] && total=@D@((total+1)); done
+            echo "TOTAL|@D@total"
+            echo "ZRAM|@D@(cat /sys/block/zram0/mm_stat 2>/dev/null)"
             echo "SWAPS_BEGIN"
             cat /proc/swaps 2>/dev/null
             echo "SWAPS_END"
             done_count=0
             for x in /proc/[0-9]*; do
-              [ -d "${'$'}x" ] || continue
-              pid=${'$'}{x##*/}
-              status="${'$'}x/status"
-              if [ ! -r "${'$'}status" ]; then
-                done_count=${'$'}((done_count+1))
-                echo "PROGRESS|${'$'}done_count|${'$'}total|读取进程|PID ${'$'}pid"
+              [ -d "@D@x" ] || continue
+              pid=@D@{x##*/}
+              status="@D@x/status"
+              if [ ! -r "@D@status" ]; then
+                done_count=@D@((done_count+1))
+                echo "PROGRESS|@D@done_count|@D@total|读取进程|PID @D@pid"
                 continue
               fi
-              vals=${'$'}(awk '/^Uid:/{u=${'$'}2} /^VmRSS:/{r=${'$'}2} /^VmSwap:/{s=${'$'}2} /^Name:/{n=${'$'}2} END{printf "%s|%s|%s|%s",u,r,s,n}' "${'$'}status" 2>/dev/null)
-              oldifs=${'$'}IFS
+              vals=@D@(awk '/^Uid:/{u=@D@2} /^VmRSS:/{r=@D@2} /^VmSwap:/{s=@D@2} /^Name:/{n=@D@2} END{printf "%s|%s|%s|%s",u,r,s,n}' "@D@status" 2>/dev/null)
+              oldifs=@D@IFS
               IFS='|'
-              set -- ${'$'}vals
-              IFS=${'$'}oldifs
-              uid=${'$'}{1:-0}; rss=${'$'}{2:-0}; vswap=${'$'}{3:-0}; name=${'$'}{4:-unknown}
-              case "${'$'}uid" in ''|*[!0-9]*) uid=0;; esac
-              case "${'$'}rss" in ''|*[!0-9]*) rss=0;; esac
-              case "${'$'}vswap" in ''|*[!0-9]*) vswap=0;; esac
-              if [ "${'$'}INCLUDE_SYSTEM" = "0" ] && [ "${'$'}uid" -lt 10000 ] 2>/dev/null; then
-                done_count=${'$'}((done_count+1))
-                echo "PROGRESS|${'$'}done_count|${'$'}total|过滤系统进程|PID ${'$'}pid"
+              set -- @D@vals
+              IFS=@D@oldifs
+              uid=@D@{1:-0}; rss=@D@{2:-0}; vswap=@D@{3:-0}; name=@D@{4:-unknown}
+              case "@D@uid" in ''|*[!0-9]*) uid=0;; esac
+              case "@D@rss" in ''|*[!0-9]*) rss=0;; esac
+              case "@D@vswap" in ''|*[!0-9]*) vswap=0;; esac
+              if [ "@D@INCLUDE_SYSTEM" = "0" ] && [ "@D@uid" -lt 10000 ] 2>/dev/null; then
+                done_count=@D@((done_count+1))
+                echo "PROGRESS|@D@done_count|@D@total|过滤系统进程|PID @D@pid"
                 continue
               fi
-              statline=${'$'}(cat "${'$'}x/stat" 2>/dev/null)
-              startticks=${'$'}(printf '%s\\n' "${'$'}statline" | awk '{sub(/^.*\\) /,""); print ${'$'}20}')
-              [ -n "${'$'}startticks" ] || startticks=0
+              statline=@D@(cat "@D@x/stat" 2>/dev/null)
+              startticks=@D@(printf '%s\n' "@D@statline" | awk '{sub(/^.*\) /,""); print @D@20}')
+              [ -n "@D@startticks" ] || startticks=0
               pss=-1
-              swap=${'$'}vswap
-              if [ "${'$'}DETAIL" = "1" ] && [ -r "${'$'}x/smaps" ]; then
-                mem=${'$'}(awk '/^Pss:/{p+=${'$'}2} /^Swap:/{s+=${'$'}2} END{printf "%d|%d",p,s}' "${'$'}x/smaps" 2>/dev/null)
-                oldifs=${'$'}IFS; IFS='|'; set -- ${'$'}mem; IFS=${'$'}oldifs
-                pss=${'$'}{1:--1}; swap=${'$'}{2:-${'$'}vswap}
+              swap=@D@vswap
+              if [ "@D@DETAIL" = "1" ] && [ -r "@D@x/smaps" ]; then
+                mem=@D@(awk '/^Pss:/{p+=@D@2} /^Swap:/{s+=@D@2} END{printf "%d|%d",p,s}' "@D@x/smaps" 2>/dev/null)
+                oldifs=@D@IFS; IFS='|'; set -- @D@mem; IFS=@D@oldifs
+                pss=@D@{1:--1}; swap=@D@{2:-@D@vswap}
               fi
-              name=${'$'}(printf '%s' "${'$'}name" | tr '|\\t\\r\\n' '____')
-              echo "PROC|${'$'}pid|${'$'}uid|${'$'}startticks|${'$'}name|${'$'}rss|${'$'}pss|${'$'}swap"
-              done_count=${'$'}((done_count+1))
-              if [ "${'$'}DETAIL" = "1" ]; then stage="详细 PSS"; else stage="基础扫描"; fi
-              echo "PROGRESS|${'$'}done_count|${'$'}total|${'$'}stage|PID ${'$'}pid"
+              name=@D@(printf '%s' "@D@name" | tr '|\\t\\r\\n' '____')
+              echo "PROC|@D@pid|@D@uid|@D@startticks|@D@name|@D@rss|@D@pss|@D@swap"
+              done_count=@D@((done_count+1))
+              if [ "@D@DETAIL" = "1" ]; then stage="详细 PSS"; else stage="基础扫描"; fi
+              echo "PROGRESS|@D@done_count|@D@total|@D@stage|PID @D@pid"
             done
             echo "SCAN_END"
         """.trimIndent()
+            .replace("@D@", "\$")
+            .replace("@DETAIL@", detailFlag)
+            .replace("@SYSTEM@", systemFlag)
 
         val process = try {
             ProcessBuilder("su", "-c", script).redirectErrorStream(true).start()
