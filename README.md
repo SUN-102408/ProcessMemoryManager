@@ -1,15 +1,21 @@
 # Process Memory Manager (PMM)
 
-Version: 0.3.0-alpha2
+Version: 0.3.0-alpha3
 
 ## Changes
-- Fix process-list scrolling inside the dashboard; allow the RecyclerView to own touch gestures.
-- Fix process-name sanitization (the previous tr character set accidentally replaced ordinary letters).
-- Decode global ZRAM mm_stat into original/compressed/physical-used sizes and ratio.
-- Add a guarded process-reclaim capability panel with kernel-version diagnostics.
-- Keep copy/share reports as plain text.
+- Read the first argument from /proc/PID/cmdline for full Android process names; fall back to /proc/PID/status Name when cmdline is unavailable.
+- Add detailed smaps metrics: PSS, Private_Dirty, Shared_Dirty, and Swap.
+- Add process sorting by RSS, PSS (falls back to RSS when PSS is unavailable), or Swap.
+- Add UID-class filtering for all processes, application UIDs, and system UIDs.
+- Preserve the alpha2 RecyclerView scrolling fix, read-only diagnostics, global ZRAM reporting, and capability-only reclaim panel.
 
-## Reclaim capability and safety
-The app does not pretend that global ZRAM activity is per-process compression. A real process-specific page-out path requires kernel support such as process_madvise() and MADV_PAGEOUT, plus runtime validation. These interfaces are not part of upstream Linux 4.4. On older kernels, the app reports the limitation and does not run drop_caches, memory.force_empty, process freezing, process killing, or global swap changes as a substitute.
+## Metric notes
+- RSS includes shared resident pages and must not be summed as unique physical memory.
+- PSS proportionally accounts for shared pages.
+- Private_Dirty and Shared_Dirty are smaps totals, in kB.
+- Per-process Swap is read from smaps in detailed mode or VmSwap in quick mode.
+- ZRAM mm_stat is global kernel accounting, not attributable to an individual process.
+- Android UIDs can include a user-id offset; UID classification uses uid modulo 100000.
 
-No process reclaim is executed by this alpha build. It remains a diagnostic/capability-check release.
+## Safety
+No process reclaim is executed. The app does not kill or freeze processes and does not use drop_caches, memory.force_empty, or global swap changes as a substitute for process-specific page-out.
