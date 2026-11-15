@@ -1,1 +1,0 @@
-PMM 0.3.0-alpha1 development branch is ready.
