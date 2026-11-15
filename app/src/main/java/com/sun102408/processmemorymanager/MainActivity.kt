@@ -35,6 +35,7 @@ class MainActivity : Activity() {
     private lateinit var includeSystem: Switch
     private lateinit var detailed: Switch
     private lateinit var includeLog: Switch
+    private lateinit var reclaimStatus: TextView
     private lateinit var adapter: ProcessAdapter
     private val executor = java.util.concurrent.Executors.newSingleThreadExecutor()
     private var snapshot: Snapshot? = null
@@ -56,7 +57,7 @@ class MainActivity : Activity() {
             setBackgroundColor(BG)
         }
         page.addView(text("PMM", 28, true, WHITE))
-        page.addView(text("PROCESS MEMORY MANAGER  ·  0.3.0-alpha1", 10, true, BLUE))
+        page.addView(text("PROCESS MEMORY MANAGER  ·  0.3.0-alpha2", 10, true, BLUE))
         val scroll = ScrollView(this)
         val content = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         scroll.addView(content)
@@ -106,16 +107,38 @@ class MainActivity : Activity() {
             addView(search)
             val recycler = RecyclerView(this@MainActivity).apply {
                 layoutManager = LinearLayoutManager(this@MainActivity)
-                isNestedScrollingEnabled = false
+                isNestedScrollingEnabled = true
+                overScrollMode = View.OVER_SCROLL_IF_CONTENT_SCROLLS
+                setOnTouchListener { view, event ->
+                    when (event.actionMasked) {
+                        android.view.MotionEvent.ACTION_DOWN,
+                        android.view.MotionEvent.ACTION_MOVE ->
+                            view.parent?.requestDisallowInterceptTouchEvent(true)
+                        android.view.MotionEvent.ACTION_UP,
+                        android.view.MotionEvent.ACTION_CANCEL ->
+                            view.parent?.requestDisallowInterceptTouchEvent(false)
+                    }
+                    false
+                }
             }
             adapter = ProcessAdapter()
             recycler.adapter = adapter
-            addView(recycler, LinearLayout.LayoutParams(-1, dp(420)))
+            addView(text("提示：在下方列表区域内上下滑动，可独立浏览全部进程。", 10, false, MUTED))
+            addView(recycler, LinearLayout.LayoutParams(-1, dp(560)))
             search.addTextChangedListener(object : android.text.TextWatcher {
                 override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) {}
                 override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) { adapter.filter(s?.toString().orEmpty()) }
                 override fun afterTextChanged(s: android.text.Editable?) {}
             })
+        })
+        content.addView(gap(10))
+        content.addView(card("指定进程内存回收（实验能力）") {
+            reclaimStatus = text(
+                "尚未检测。此功能必须由内核提供 process_madvise + MADV_PAGEOUT 等接口；不支持时不会用 drop_caches 等全局操作冒充进程级压缩。",
+                12, false, MUTED
+            )
+            addView(reclaimStatus)
+            addView(button("检测本机进程回收能力") { checkReclaimSupport() })
         })
         content.addView(gap(10))
         content.addView(card("诊断与报告") {
@@ -126,7 +149,7 @@ class MainActivity : Activity() {
             addView(button("复制完整诊断报告") { copyReport() })
             addView(button("分享纯文字诊断报告") { shareReport() })
             addView(button("只读检测内核能力") { probeKernel() })
-            addView(text("安全边界：本版本只读，不杀进程、不冻结进程、不执行页面回收，也不修改 /proc、/sys、cgroup 或 Swap。", 11, false, MUTED))
+            addView(text("安全边界：不杀进程、不冻结进程；仅在内核明确支持进程级回收时才考虑启用。不会使用 drop_caches、memory.force_empty 或修改全局 Swap 参数代替。", 11, false, MUTED))
         })
         setContentView(page)
     }
@@ -202,7 +225,7 @@ class MainActivity : Activity() {
                     summary.text = "时间：" + s.time + "\n耗时：" + result.duration + " ms\n进程数：" + s.processes.size +
                         "\nPSS 合计：" + pss + "\nRSS 合计：" + formatKb(s.processes.sumOf { it.rssKb }) +
                         "\n进程 Swap 合计：" + formatKb(s.processes.sumOf { it.swapKb }) +
-                        "\nZRAM（全局 mm_stat）：" + s.zram + "\nSwap 设备：" + s.swaps
+                        "\nZRAM（全局）：" + formatZram(s.zram) + "\nSwap 设备：" + s.swaps
                     adapter.submit(s.processes)
                     rootStatus.text = "扫描完成。数据只读，没有修改系统状态。"
                     progressText.text = "完成 · " + s.processes.size + " 个进程 · " + result.duration + " ms"
@@ -212,13 +235,13 @@ class MainActivity : Activity() {
     }
 
     private fun makeReport(): String = buildString {
-        append("Process Memory Manager 诊断报告\n版本：0.3.0-alpha1\n")
+        append("Process Memory Manager 诊断报告\n版本：0.3.0-alpha2\n")
         append("设备：" + Build.MANUFACTURER + " " + Build.MODEL + " / Android " + Build.VERSION.RELEASE + "\n")
         append("生成时间：" + now() + "\n状态：" + lastStatus + "\n耗时：" + lastDuration + " ms\n\n")
         if (lastError.isNotBlank()) append("[错误]\n" + lastError + "\n\n")
         val s = snapshot
         if (s == null) append("尚无成功扫描快照。\n") else {
-            append("[概览]\n时间：" + s.time + "\n进程数：" + s.processes.size + "\nZRAM（全局）：" + s.zram + "\nSwap：" + s.swaps + "\n\n")
+            append("[概览]\n时间：" + s.time + "\n进程数：" + s.processes.size + "\nZRAM（全局）：" + formatZram(s.zram) + "\nSwap：" + s.swaps + "\n\n")
             append("[进程列表]\n")
             s.processes.forEach {
                 append(it.name + "\tPID=" + it.pid + "\tUID=" + it.uid + "\tRSS=" + it.rssKb + "KB\tPSS=" +
@@ -238,10 +261,35 @@ class MainActivity : Activity() {
     private fun shareReport() {
         val send = Intent(Intent.ACTION_SEND).apply {
             type = "text/plain"
-            putExtra(Intent.EXTRA_SUBJECT, "PMM 0.3.0-alpha1 诊断报告")
+            putExtra(Intent.EXTRA_SUBJECT, "PMM 0.3.0-alpha2 诊断报告")
             putExtra(Intent.EXTRA_TEXT, makeReport())
         }
         startActivity(Intent.createChooser(send, "分享纯文字报告"))
+    }
+
+    private fun checkReclaimSupport() {
+        reclaimStatus.text = "正在读取内核版本与相关接口…"
+        executor.execute {
+            val r = Root.run(
+                "echo KERNEL=\$(uname -r); echo ARCH=\$(uname -m); " +
+                    "echo PROC_RECLAIM=\$(if [ -e /proc/self/reclaim ]; then echo yes; else echo no; fi); " +
+                    "echo PROCESS_MADVISE=requires_kernel_5.10_or_vendor_backport; " +
+                    "echo MADV_PAGEOUT=requires_kernel_5.4_or_vendor_backport",
+                20
+            )
+            runOnUiThread {
+                val kernel = r.output.lineSequence().firstOrNull { it.startsWith("KERNEL=") }?.substringAfter("=") ?: "unknown"
+                val majorMinor = Regex("^(\\d+)\\.(\\d+)").find(kernel)
+                val major = majorMinor?.groupValues?.getOrNull(1)?.toIntOrNull() ?: 0
+                val minor = majorMinor?.groupValues?.getOrNull(2)?.toIntOrNull() ?: 0
+                val upstreamOld = major < 5 || (major == 5 && minor < 10)
+                reclaimStatus.text = if (upstreamOld) {
+                    "检测到内核 $kernel。上游 Linux 的 process_madvise 从 5.10 引入，MADV_PAGEOUT 从 5.4 引入；此内核版本不具备上游实现。厂商回移植情况尚未实测，因此本机暂不开放进程级回收，避免误操作。\n\n" + r.output
+                } else {
+                    "检测到内核 $kernel。版本满足上游接口引入门槛，但这不等于 syscall 一定可用；下一步仍需做无副作用 syscall 探测与目标进程验证。当前尚未执行任何回收。\n\n" + r.output
+                }
+            }
+        }
     }
 
     private fun probeKernel() {
@@ -256,6 +304,20 @@ class MainActivity : Activity() {
 
     private fun now() = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US).format(Date())
     private fun formatKb(kb: Long) = if (kb >= 1024) String.format(Locale.US, "%.1f MB", kb / 1024.0) else "$kb KB"
+
+    private fun formatZram(raw: String): String {
+        val values = raw.trim().split(Regex("\\s+")).mapNotNull { it.toLongOrNull() }
+        if (values.size < 3) return raw.ifBlank { "不可用" }
+        val original = values[0]
+        val compressed = values[1]
+        val used = values[2]
+        val ratio = if (compressed > 0) original.toDouble() / compressed else 0.0
+        return "原始数据 " + formatBytes(original) + "；压缩数据 " + formatBytes(compressed) +
+            "；实际占用 " + formatBytes(used) + "；压缩比 " +
+            (if (ratio > 0) String.format(Locale.US, "%.2f:1", ratio) else "不可用") + "（内核全局统计）"
+    }
+
+    private fun formatBytes(bytes: Long) = String.format(Locale.US, "%.1f MiB", bytes / 1048576.0)
 
     private inner class ProcessAdapter : RecyclerView.Adapter<ProcessAdapter.Holder>() {
         private var all: List<ProcessItem> = emptyList()
@@ -372,7 +434,7 @@ private object Root {
                 oldifs=@D@IFS; IFS='|'; set -- @D@mem; IFS=@D@oldifs
                 pss=@D@{1:--1}; swap=@D@{2:-@D@vswap}
               fi
-              name=@D@(printf '%s' "@D@name" | tr '|\\t\\r\\n' '____')
+              name=@D@(printf '%s' "@D@name" | tr '|' '_')
               echo "PROC|@D@pid|@D@uid|@D@startticks|@D@name|@D@rss|@D@pss|@D@swap"
               done_count=@D@((done_count+1))
               if [ "@D@DETAIL" = "1" ]; then stage="详细 PSS"; else stage="基础扫描"; fi
